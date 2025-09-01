@@ -11,7 +11,88 @@ when ODIN_OS == .Darwin {
     foreign import moltenvk "MoltenVK"
 }
 
-main :: proc () {
+resize_swapchain :: proc(  
+    vk_device: vk.Device,
+    vk_physical_device: vk.PhysicalDevice,
+    vk_surface: vk.SurfaceKHR,
+    vk_swapchain: ^vk.SwapchainKHR,
+    vk_swapchain_image_count: ^u32,
+    vk_swapchain_images: ^[dynamic]vk.Image,
+    vk_swapchain_image_views: ^[dynamic]vk.ImageView,
+    vk_swapchain_image_finished_semaphores: ^[dynamic]vk.Semaphore
+) -> vk.SurfaceCapabilitiesKHR {
+    assert(vk.DeviceWaitIdle(vk_device) == .SUCCESS)
+    vk_surface_capabilites := vk.SurfaceCapabilitiesKHR {}
+    assert(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, vk_surface, &vk_surface_capabilites) == .SUCCESS)
+
+    vk_old_swapchain := vk_swapchain^
+    vk_result := vk.CreateSwapchainKHR(vk_device, &{
+        sType = .SWAPCHAIN_CREATE_INFO_KHR,
+        surface = vk_surface,
+        minImageCount = 3,
+        imageFormat = .B8G8R8A8_UNORM,
+        imageColorSpace = .SRGB_NONLINEAR,
+        imageExtent = vk_surface_capabilites.currentExtent,
+        imageArrayLayers = 1,
+        imageUsage = { .COLOR_ATTACHMENT },
+        imageSharingMode = .EXCLUSIVE,
+        preTransform = { .IDENTITY },
+        compositeAlpha = { .OPAQUE },
+        presentMode = .FIFO,
+        oldSwapchain = vk_old_swapchain,
+    }, nil, vk_swapchain)
+    assert(vk_result == .SUCCESS)
+    vk.DestroySwapchainKHR(vk_device, vk_old_swapchain, nil)
+
+    for iv in vk_swapchain_image_views {
+        vk.DestroyImageView(vk_device, iv, nil)
+    }
+
+    vk_old_swapchain_image_count := vk_swapchain_image_count^
+    assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain^, vk_swapchain_image_count, nil) == .SUCCESS)
+
+    for i in vk_swapchain_image_count^..<vk_old_swapchain_image_count {
+        vk.DestroySemaphore(vk_device, vk_swapchain_image_finished_semaphores^[i], nil)
+    }
+
+    resize(vk_swapchain_images, vk_swapchain_image_count^)
+    assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain^, vk_swapchain_image_count, &(vk_swapchain_images^[0])) == .SUCCESS)
+
+    resize(vk_swapchain_image_views, vk_swapchain_image_count^)
+    resize(vk_swapchain_image_finished_semaphores, vk_swapchain_image_count^)
+    
+    for i in 0..<vk_swapchain_image_count^ {
+        assert(vk.CreateImageView(vk_device, &{
+            sType = .IMAGE_VIEW_CREATE_INFO,
+            image = vk_swapchain_images^[i],
+            viewType = .D2,
+            format = .B8G8R8A8_UNORM,
+            components = {
+                r = .IDENTITY,
+                g = .IDENTITY,
+                b = .IDENTITY,
+                a = .IDENTITY,
+            },
+            subresourceRange = {
+                aspectMask = { .COLOR },
+                baseMipLevel = 0,
+                levelCount = 1,
+                baseArrayLayer = 0,
+                layerCount = 1,
+            },
+        }, nil, &(vk_swapchain_image_views^[i])) == .SUCCESS)
+    
+        if i >= vk_old_swapchain_image_count {
+            assert(vk.CreateSemaphore(vk_device, &{
+                sType = .SEMAPHORE_CREATE_INFO,
+            }, nil, &(vk_swapchain_image_finished_semaphores^[i])) == .SUCCESS)
+        }
+    }
+
+    return vk_surface_capabilites
+}
+
+main :: proc() {
     assert(sdl3.Init({ .VIDEO }))
     assert(sdl3.Vulkan_LoadLibrary(nil))
 
@@ -46,6 +127,11 @@ main :: proc () {
         vk_instance_flags |= .ENUMERATE_PORTABILITY_KHR
     }
 
+    vk_instance_layers := make([dynamic]cstring, 0, 1)
+    when ODIN_DEBUG {
+        append(&vk_instance_layers, "VK_LAYER_KHRONOS_validation")
+    }
+
     vk_instance: vk.Instance
     vk_result := vk.CreateInstance(&{
         sType = .INSTANCE_CREATE_INFO,
@@ -57,14 +143,13 @@ main :: proc () {
             engineVersion = vk.MAKE_VERSION(1, 0, 0),
             apiVersion = vk.API_VERSION_1_2,
         },
-        enabledLayerCount = 0,
-        ppEnabledLayerNames = nil,
+        enabledLayerCount = u32(len(vk_instance_layers)),
+        ppEnabledLayerNames = len(vk_instance_layers) == 0 ? nil : &vk_instance_layers[0],
         enabledExtensionCount = u32(len(vk_instance_extensions)),
         ppEnabledExtensionNames = &vk_instance_extensions[0]
     }, nil, &vk_instance)
     delete(vk_instance_extensions)
     delete(vk_available_instance_extensions)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.DestroyInstance(vk_instance, nil)
 
@@ -82,11 +167,10 @@ main :: proc () {
         },
         pUserData = nil
     }, nil, &vk_debug_utils_messenger)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.DestroyDebugUtilsMessengerEXT(vk_instance, vk_debug_utils_messenger, nil)
 
-    window := sdl3.CreateWindow("voxels", 1200, 900, { .VULKAN })
+    window := sdl3.CreateWindow("voxels", 1200, 900, { .VULKAN, .RESIZABLE })
     assert(window != nil)
     defer sdl3.DestroyWindow(window)
 
@@ -184,7 +268,6 @@ main :: proc () {
         pEnabledFeatures = &vk_physical_device_features,
     }, nil, &vk_device)
     delete(vk_device_extensions)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.DestroyDevice(vk_device, nil)
 
@@ -197,7 +280,6 @@ main :: proc () {
         flags = {},
         queueFamilyIndex = 0,
     }, nil, &vk_command_pool)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.DestroyCommandPool(vk_device, vk_command_pool, nil)
 
@@ -208,9 +290,11 @@ main :: proc () {
         level = .PRIMARY,
         commandBufferCount = 1,
     }, &vk_command_buffer)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.FreeCommandBuffers(vk_device, vk_command_pool, 1, &vk_command_buffer)
+
+    vk_surface_capabilities: vk.SurfaceCapabilitiesKHR
+    assert(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, vk_surface, &vk_surface_capabilities) == .SUCCESS)
 
     vk_swapchain: vk.SwapchainKHR
     vk_result = vk.CreateSwapchainKHR(vk_device, &{
@@ -219,28 +303,25 @@ main :: proc () {
         minImageCount = 3,
         imageFormat = .B8G8R8A8_UNORM,
         imageColorSpace = .SRGB_NONLINEAR,
-        imageExtent = {
-            width = 1200,
-            height = 900,
-        },
+        imageExtent = vk_surface_capabilities.currentExtent,
         imageArrayLayers = 1,
         imageUsage = { .COLOR_ATTACHMENT },
         imageSharingMode = .EXCLUSIVE,
-        preTransform = { .IDENTITY },
+        preTransform = vk_surface_capabilities.currentTransform,
         compositeAlpha = { .OPAQUE },
         presentMode = .FIFO,
     }, nil, &vk_swapchain)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.DestroySwapchainKHR(vk_device, vk_swapchain, nil)
 
     vk_swapchain_image_count: u32
     assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain, &vk_swapchain_image_count, nil) == .SUCCESS)
 
-    vk_swapchain_images := make([]vk.Image, vk_swapchain_image_count)
+    vk_swapchain_images := make([dynamic]vk.Image, vk_swapchain_image_count)
     assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images[0]) == .SUCCESS)
 
-    vk_swapchain_image_views := make([]vk.ImageView, vk_swapchain_image_count)
+    vk_swapchain_image_views := make([dynamic]vk.ImageView, vk_swapchain_image_count)
+    vk_swapchain_image_finished_semaphores := make([dynamic]vk.Semaphore, vk_swapchain_image_count)
     for i in 0..<vk_swapchain_image_count {
         assert(vk.CreateImageView(vk_device, &{
             sType = .IMAGE_VIEW_CREATE_INFO,
@@ -261,42 +342,37 @@ main :: proc () {
                 layerCount = 1,
             },
         }, nil, &vk_swapchain_image_views[i]) == .SUCCESS)
+
+        assert(vk.CreateSemaphore(vk_device, &{
+            sType = .SEMAPHORE_CREATE_INFO,
+        }, nil, &vk_swapchain_image_finished_semaphores[i]) == .SUCCESS)
     }
 
     defer {
         for i in 0..<vk_swapchain_image_count {
             vk.DestroyImageView(vk_device, vk_swapchain_image_views[i], nil)
+            vk.DestroySemaphore(vk_device, vk_swapchain_image_finished_semaphores[i], nil)
         }
 
         delete(vk_swapchain_image_views)
+        delete(vk_swapchain_image_finished_semaphores)
     }
     
     vk_image_acquisition_semaphore: vk.Semaphore
     vk_result = vk.CreateSemaphore(vk_device, &{
         sType = .SEMAPHORE_CREATE_INFO,
     }, nil, &vk_image_acquisition_semaphore)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.DestroySemaphore(vk_device, vk_image_acquisition_semaphore, nil)
-
-    vk_render_finished_semaphore: vk.Semaphore
-    vk_result = vk.CreateSemaphore(vk_device, &{
-        sType = .SEMAPHORE_CREATE_INFO,
-    }, nil, &vk_render_finished_semaphore)
-    fmt.println(vk_result)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroySemaphore(vk_device, vk_render_finished_semaphore, nil)
 
     vk_in_flight_fence: vk.Fence
     vk_result = vk.CreateFence(vk_device, &{
         sType = .FENCE_CREATE_INFO,
         flags = { .SIGNALED },
     }, nil, &vk_in_flight_fence)
-    fmt.println(vk_result)
     assert(vk_result == .SUCCESS)
     defer vk.DestroyFence(vk_device, vk_in_flight_fence, nil)
 
-    vk_image_index := vk_swapchain_image_count - 1
     main_loop: for true {
         event: sdl3.Event
         for sdl3.PollEvent(&event) {
@@ -305,16 +381,18 @@ main :: proc () {
             }
         }
 
-        assert(vk.WaitForFences(vk_device, 1, &vk_in_flight_fence, true, max(u64)) == .SUCCESS)
-        assert(vk.ResetFences(vk_device, 1, &vk_in_flight_fence) == .SUCCESS)
+        vk.WaitForFences(vk_device, 1, &vk_in_flight_fence, true, max(u64))
 
-        vk_image_acquisition_semaphore_index := (vk_image_index + 1) % vk_swapchain_image_count
-        fmt.println("swapchain semaphore index:", vk_image_acquisition_semaphore_index)
-        assert(vk.AcquireNextImageKHR(vk_device, vk_swapchain, max(u64), vk_image_acquisition_semaphore, vk_in_flight_fence, &vk_image_index) == .SUCCESS)
-        
-        assert(vk.WaitForFences(vk_device, 1, &vk_in_flight_fence, true, max(u64)) == .SUCCESS)
-        assert(vk.ResetFences(vk_device, 1, &vk_in_flight_fence) == .SUCCESS)
-        fmt.println("swapchain image index:", vk_image_index)
+        vk_image_index: u32
+        vk_result = vk.AcquireNextImageKHR(vk_device, vk_swapchain, max(u64), vk_image_acquisition_semaphore, 0, &vk_image_index)
+        if vk_result == .ERROR_OUT_OF_DATE_KHR {
+            vk_surface_capabilities = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
+            continue
+        } else if vk_result != .SUCCESS && vk_result != .SUBOPTIMAL_KHR {
+            fmt.panicf("Failed to acquire swapchain image: %s", vk_result)
+        }
+
+        vk.ResetFences(vk_device, 1, &vk_in_flight_fence)
 
         assert(vk.ResetCommandPool(vk_device, vk_command_pool, {}) == .SUCCESS)
         assert(vk.BeginCommandBuffer(vk_command_buffer, &{
@@ -348,8 +426,8 @@ main :: proc () {
                     y = 0,
                 },
                 extent = {
-                    width = 1200,
-                    height = 900,
+                    width = vk_surface_capabilities.currentExtent.width,
+                    height = vk_surface_capabilities.currentExtent.height,
                 },
             },
             layerCount = 1,
@@ -363,7 +441,7 @@ main :: proc () {
                 storeOp = .STORE,
                 clearValue = {
                     color = {
-                        float32 = { 0.0, 1.0, 0.0, 1.0 },
+                        float32 = { 0.0, 0.3, 0.0, 1.0 },
                     }
                 }
             },
@@ -394,22 +472,30 @@ main :: proc () {
         assert(vk.QueueSubmit(vk_queue, 1, &vk.SubmitInfo {
             sType = .SUBMIT_INFO,
             waitSemaphoreCount = 1,
-            pWaitSemaphores = &vk_swapchain_image_acquisition_semaphores[vk_image_acquisition_semaphore_index],
+            pWaitSemaphores = &vk_image_acquisition_semaphore,
             commandBufferCount = 1,
             pCommandBuffers = &vk_command_buffer,
             signalSemaphoreCount = 1,
-            pSignalSemaphores = &vk_render_finished_semaphore,
+            pSignalSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
             pWaitDstStageMask = &wait_stage,
         }, vk_in_flight_fence) == .SUCCESS)
 
-        assert(vk.QueuePresentKHR(vk_queue, &{
+        vk_present_results: vk.Result
+        vk_result = vk.QueuePresentKHR(vk_queue, &{
             sType = .PRESENT_INFO_KHR,
             waitSemaphoreCount = 1,
-            pWaitSemaphores = &vk_render_finished_semaphore,
+            pWaitSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
             swapchainCount = 1,
             pSwapchains = &vk_swapchain,
             pImageIndices = &vk_image_index,
-        }) == .SUCCESS)
+            pResults = &vk_present_results,
+        })
+
+        if vk_result == .ERROR_OUT_OF_DATE_KHR || vk_result == .SUBOPTIMAL_KHR {
+            vk_surface_capabilities = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
+        } else if vk_result != .SUCCESS {
+            fmt.panicf("Failed to present: %s", vk_result)
+        }
     }
 
     assert(vk.DeviceWaitIdle(vk_device) == .SUCCESS)
