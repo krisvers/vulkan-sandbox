@@ -5,6 +5,9 @@ import "core:fmt"
 import vk "vendor:vulkan"
 import "vendor:sdl3"
 import "vendor:directx/dxc"
+import "core:c"
+import "core:strings"
+import "core:unicode/utf16"
 
 when ODIN_OS == .Darwin {
     @(export)
@@ -208,9 +211,169 @@ bind_resources_to_allocation :: proc(
     return
 }
 
+when ODIN_OS == .Windows {
+    @(private) _convert_cstring_to_wstring :: proc(s: string) -> []c.wchar_t {
+        wstring := make([]c.wchar_t, len(s) + 1)
+        utf16.encode_string(wstring, s)
+        wstring[len(s)] = 0
+        return wstring
+    }
+} else {
+    @(private) _convert_cstring_to_wstring :: proc(s: string) -> []c.wchar_t {
+        wstring := make([]c.wchar_t, len(s) + 1)
+        for i in 0..<len(s) {
+            wstring[i] = c.wchar_t(s[i])
+        }
+        wstring[len(s)] = 0
+        return wstring
+    }
+}
+
+compile_hlsl :: proc(
+    vk_device: vk.Device,
+    dxc_utils: ^dxc.IUtils,
+    dxc_compiler: ^dxc.ICompiler,
+    source: cstring,
+    entry_point: cstring,
+    stage: vk.ShaderStageFlags
+) -> (module: vk.ShaderModule, result: vk.Result) {
+    dxc_blob_encoding: ^dxc.IBlobEncoding
+    if dxc_utils->CreateBlob(rawptr(source), u32(len(source)), dxc.CP_UTF8, &dxc_blob_encoding) != 0 {
+        return 0, .ERROR_UNKNOWN
+    }
+    defer dxc_blob_encoding->Release()
+
+    wtarget := _convert_cstring_to_wstring("-T")
+    wtarget_value: []c.wchar_t
+    if .VERTEX in stage {
+        wtarget_value = _convert_cstring_to_wstring("vs_6_0")
+    } else if .FRAGMENT in stage {
+        wtarget_value = _convert_cstring_to_wstring("ps_6_0")
+    } else if .COMPUTE in stage {
+        wtarget_value = _convert_cstring_to_wstring("cs_6_0")
+    } else if .GEOMETRY in stage {
+        wtarget_value = _convert_cstring_to_wstring("gs_6_0")
+    } else if .TESSELLATION_CONTROL in stage {
+        wtarget_value = _convert_cstring_to_wstring("hs_6_0")
+    } else if .TESSELLATION_EVALUATION in stage {
+        wtarget_value = _convert_cstring_to_wstring("ds_6_0")
+    }
+
+    wentry := _convert_cstring_to_wstring("-E")
+    wentry_value := _convert_cstring_to_wstring(string(entry_point))
+
+    wspirv := _convert_cstring_to_wstring("-spirv")
+    wdebug := _convert_cstring_to_wstring("-Zi")
+
+    defer {
+        delete(wtarget)
+        delete(wtarget_value)
+        delete(wentry)
+        delete(wentry_value)
+        delete(wspirv)
+        delete(wdebug)
+    }
+
+    dxc_arguments: [6]dxc.wstring
+    dxc_arguments[0] = &wtarget[0]
+    dxc_arguments[1] = &wtarget_value[0]
+    dxc_arguments[2] = &wentry[0]
+    dxc_arguments[3] = &wentry_value[0]
+    dxc_arguments[4] = &wspirv[0]
+
+    dxc_argument_count := u32(5)
+
+    when ODIN_DEBUG {
+        dxc_arguments[dxc_argument_count] = &wdebug[0]
+        dxc_argument_count += 1
+    }
+
+    dxc_result: ^dxc.IResult
+    if dxc_compiler->Compile(
+        dxc_blob_encoding,
+        nil,
+        &wentry_value[0],
+        &wtarget_value[0],
+        &dxc_arguments[0],
+        dxc_argument_count,
+        nil,
+        0,
+        nil,
+        (^^dxc.IOperationResult)(&dxc_result)
+    ) != 0 {
+        return 0, .ERROR_UNKNOWN
+    }
+    defer dxc_result->Release()
+
+    handle_error_with_msg := proc(dxc_result: ^dxc.IResult) {
+        blob: ^dxc.IBlobEncoding
+        if dxc_result->GetErrorBuffer(&blob) != 0 {
+            fmt.println("DXC compilation failed (no error message available)")
+            return
+        }
+
+        known: dxc.BOOL
+        encoding: u32
+        if blob->GetEncoding(&known, &encoding) != 0 || !known || encoding != dxc.CP_UTF8 && encoding != dxc.CP_UTF16 {
+            fmt.println("DXC compilation failed (no error message available)")
+            return
+        }
+
+        switch encoding {
+            case dxc.CP_UTF8: fmt.printf("DXC compilation error: %s", strings.string_from_ptr(([^]u8)(blob->GetBufferPointer()), int(blob->GetBufferSize())))
+            case dxc.CP_UTF16:
+                st := make([]u8, blob->GetBufferSize() / 2)
+                utf16.decode_to_utf8(st, ([^]u16)(blob->GetBufferPointer())[:blob->GetBufferSize() / 2])
+                fmt.printf("DXC compilation error: %s", string(st))
+                delete(st)
+        }
+    }
+
+    dxc_result_hresult: dxc.HRESULT
+    dxc_result->GetStatus(&dxc_result_hresult)
+    if dxc_result_hresult != 0 {
+        handle_error_with_msg(dxc_result)
+        return 0, .ERROR_UNKNOWN
+    }
+
+    dxc_blob: ^dxc.IBlob
+    if dxc_result->GetResult(&dxc_blob) != 0 {
+        handle_error_with_msg(dxc_result)
+        return 0, .ERROR_UNKNOWN
+    }
+
+    if dxc_blob->GetBufferPointer() == nil || dxc_blob->GetBufferSize() == 0 {
+        handle_error_with_msg(dxc_result)
+        return 0, .ERROR_UNKNOWN
+    }
+
+    spirv_size := int(dxc_blob->GetBufferSize())
+    spirv_code := ([^]u32)(dxc_blob->GetBufferPointer())
+
+    result = vk.CreateShaderModule(vk_device, &{
+        sType = .SHADER_MODULE_CREATE_INFO,
+        codeSize = spirv_size,
+        pCode = spirv_code
+    }, nil, &module)
+
+    if result != .SUCCESS {
+        return 0, result
+    }
+
+    return module, .SUCCESS
+}
+
 main :: proc() {
     assert(sdl3.Init({ .VIDEO }))
     assert(sdl3.Vulkan_LoadLibrary(nil))
+
+    dxc_utils: ^dxc.IUtils
+    assert(dxc.CreateInstance(dxc.Utils_CLSID, dxc.IUtils_UUID, &dxc_utils) == 0)
+    defer dxc_utils->Release()
+
+    dxc_compiler: ^dxc.ICompiler
+    assert(dxc.CreateInstance(dxc.Compiler_CLSID, dxc.ICompiler_UUID, &dxc_compiler) == 0)
+    defer dxc_compiler->Release()
 
     sdl_vk_proc_addr := sdl3.Vulkan_GetVkGetInstanceProcAddr()
     assert(sdl_vk_proc_addr != nil)
@@ -240,7 +403,7 @@ main :: proc() {
 
     vk_instance_flags := vk.InstanceCreateFlags {}
     when ODIN_OS == .Darwin {
-        vk_instance_flags |= .ENUMERATE_PORTABILITY_KHR
+        vk_instance_flags |= { .ENUMERATE_PORTABILITY_KHR }
     }
 
     vk_instance_layers := make([dynamic]cstring, 0, 1)
@@ -253,9 +416,9 @@ main :: proc() {
         sType = .INSTANCE_CREATE_INFO,
         flags = vk_instance_flags,
         pApplicationInfo = &{
-            pApplicationName = "voxels",
+            pApplicationName = "vulkan",
             applicationVersion = vk.MAKE_VERSION(1, 0, 0),
-            pEngineName = "voxels",
+            pEngineName = "vulkan",
             engineVersion = vk.MAKE_VERSION(1, 0, 0),
             apiVersion = vk.API_VERSION_1_2,
         },
@@ -522,6 +685,24 @@ main :: proc() {
     delete(vk_voxel_texture_offsets)
 
     assert(bind_resources_to_allocation(vk_device, vk_voxel_memory, { vk_voxel_texture }, {}, { vk_voxel_texture_offset }) == .SUCCESS)
+
+    vk_graphics_pipeline_layout: vk.PipelineLayout
+
+    vk_graphics_pipeline_shader_stages := [2]vk.PipelineShaderStageCreateInfo {
+        {
+
+        },
+        {
+
+        }
+    }
+
+    vk_graphics_pipeline: vk.Pipeline
+    vk_result = vk.CreateGraphicsPipelines(vk_device, 0, 1, &vk.GraphicsPipelineCreateInfo {
+        sType = .GRAPHICS_PIPELINE_CREATE_INFO,
+        stageCount = 2,
+        pStages = &vk_graphics_pipeline_shader_stages[0],
+    }, nil, &vk_graphics_pipeline)
 
     vk_swapchain_enabled := true
     main_loop: for true {
