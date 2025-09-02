@@ -20,10 +20,14 @@ resize_swapchain :: proc(
     vk_swapchain_images: ^[dynamic]vk.Image,
     vk_swapchain_image_views: ^[dynamic]vk.ImageView,
     vk_swapchain_image_finished_semaphores: ^[dynamic]vk.Semaphore
-) -> vk.SurfaceCapabilitiesKHR {
+) -> (vk.SurfaceCapabilitiesKHR, bool) {
     assert(vk.DeviceWaitIdle(vk_device) == .SUCCESS)
     vk_surface_capabilites := vk.SurfaceCapabilitiesKHR {}
     assert(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, vk_surface, &vk_surface_capabilites) == .SUCCESS)
+
+    if vk_surface_capabilites.currentExtent.width == 0 || vk_surface_capabilites.currentExtent.height == 0 {
+        return vk_surface_capabilites, false
+    }
 
     vk_old_swapchain := vk_swapchain^
     vk_result := vk.CreateSwapchainKHR(vk_device, &{
@@ -89,7 +93,119 @@ resize_swapchain :: proc(
         }
     }
 
-    return vk_surface_capabilites
+    return vk_surface_capabilites, true
+}
+
+find_memory_type_index :: proc(
+    vk_physical_device: vk.PhysicalDevice,
+    vk_memory_type_bits: u32,
+    vk_memory_properties: vk.MemoryPropertyFlags
+) -> u32 {
+    vk_physical_device_memory_properties: vk.PhysicalDeviceMemoryProperties
+    vk.GetPhysicalDeviceMemoryProperties(vk_physical_device, &vk_physical_device_memory_properties)
+
+    for i in 0..<vk_physical_device_memory_properties.memoryTypeCount {
+        if (vk_memory_type_bits & (1 << i)) != 0 && (vk_physical_device_memory_properties.memoryTypes[i].propertyFlags & vk_memory_properties) == vk_memory_properties {
+            return i
+        }
+    }
+
+    return vk.MAX_MEMORY_TYPES
+}
+
+allocate_for_resources :: proc(
+    vk_device: vk.Device,
+    vk_physical_device: vk.PhysicalDevice,
+    vk_images: []vk.Image,
+    vk_buffers: []vk.Buffer,
+    vk_memory_properties: vk.MemoryPropertyFlags
+) -> (memory: vk.DeviceMemory, sizes: []vk.DeviceSize, offsets: []vk.DeviceSize, result: vk.Result) {
+    vk_memory_type_index: u32
+    vk_memory_requirementses := make([]vk.MemoryRequirements, len(vk_images) + len(vk_buffers))
+    sizes = make([]vk.DeviceSize, len(vk_images) + len(vk_buffers))
+    offsets = make([]vk.DeviceSize, len(vk_images) + len(vk_buffers))
+    defer {
+        delete(vk_memory_requirementses)
+    }
+
+    total_size: vk.DeviceSize
+    for i in 0..<len(vk_images) {
+        vk.GetImageMemoryRequirements(vk_device, vk_images[i], &vk_memory_requirementses[i])
+        ti := find_memory_type_index(vk_physical_device, vk_memory_requirementses[i].memoryTypeBits, vk_memory_properties)
+        if ti == vk.MAX_MEMORY_TYPES {
+            delete(sizes)
+            delete(offsets)
+            return 0, {}, {}, .ERROR_UNKNOWN
+        } else if ti != vk_memory_type_index && i != 0 {
+            delete(sizes)
+            delete(offsets)
+            return 0, {}, {}, .ERROR_FRAGMENTED_POOL
+        }
+
+        r := total_size % vk_memory_requirementses[i].alignment
+        total_size = total_size + r == 0 ? 0 : vk_memory_requirementses[i].alignment - r
+        offsets[i] = total_size
+        sizes[i] = vk_memory_requirementses[i].size
+        total_size += sizes[i]
+    }
+
+    for i in 0..<len(vk_buffers) {
+        vk.GetBufferMemoryRequirements(vk_device, vk_buffers[i], &vk_memory_requirementses[i + len(vk_images)])
+        ti := find_memory_type_index(vk_physical_device, vk_memory_requirementses[i + len(vk_images)].memoryTypeBits, vk_memory_properties)
+        if ti == vk.MAX_MEMORY_TYPES {
+            delete(sizes)
+            delete(offsets)
+            return 0, {}, {}, .ERROR_UNKNOWN
+        } else if ti != vk_memory_type_index && i + len(vk_images) != 0 {
+            delete(sizes)
+            delete(offsets)
+            return 0, {}, {}, .ERROR_FRAGMENTED_POOL
+        }
+
+        r := total_size % vk_memory_requirementses[i + len(vk_images)].alignment
+        total_size = total_size + r == 0 ? 0 : vk_memory_requirementses[i + len(vk_images)].alignment - r
+        offsets[i + len(vk_images)] = total_size
+        sizes[i + len(vk_images)] = vk_memory_requirementses[i + len(vk_images)].size
+        total_size += sizes[i + len(vk_images)]
+    }
+
+    result = vk.AllocateMemory(vk_device, &{
+        sType = .MEMORY_ALLOCATE_INFO,
+        allocationSize = total_size,
+        memoryTypeIndex = vk_memory_type_index,
+    }, nil, &memory)
+
+    if result != .SUCCESS {
+        delete(sizes)
+        delete(offsets)
+        return 0, {}, {}, result
+    }
+
+    return
+}
+
+bind_resources_to_allocation :: proc(
+    vk_device: vk.Device,
+    vk_memory: vk.DeviceMemory,
+    vk_images: []vk.Image,
+    vk_buffers: []vk.Buffer,
+    offsets: []vk.DeviceSize
+) -> (result := vk.Result.SUCCESS) {
+    for i in 0..<len(vk_images) {
+        r := vk.BindImageMemory(vk_device, vk_images[i], vk_memory, offsets[i])
+        if r != .SUCCESS {
+            result = r
+        }
+    }
+
+    for i in 0..<len(vk_buffers) {
+        r := vk.BindBufferMemory(vk_device, vk_buffers[i], vk_memory, offsets[i + len(vk_images)])
+        if r != .SUCCESS {
+            result = r
+        }
+    }
+
+    return
 }
 
 main :: proc() {
@@ -373,128 +489,167 @@ main :: proc() {
     assert(vk_result == .SUCCESS)
     defer vk.DestroyFence(vk_device, vk_in_flight_fence, nil)
 
+    vk_voxel_texture: vk.Image
+    vk_result = vk.CreateImage(vk_device, &{
+        sType = .IMAGE_CREATE_INFO,
+        imageType = .D3,
+        format = .R8_UINT,
+        extent = {
+            width = 4,
+            height = 4,
+            depth = 4,
+        },
+        mipLevels = 3,
+        arrayLayers = 1,
+        samples = { ._1 },
+        tiling = .OPTIMAL,
+        usage = { .STORAGE },
+        sharingMode = .EXCLUSIVE,
+        initialLayout = .UNDEFINED,
+    }, nil, &vk_voxel_texture)
+    assert(vk_result == .SUCCESS)
+
+    vk_voxel_memory, vk_voxel_texture_sizes, vk_voxel_texture_offsets, vk_voxel_allocation_result := allocate_for_resources(vk_device, vk_physical_device, { vk_voxel_texture }, {}, { .DEVICE_LOCAL })
+    assert(vk_voxel_allocation_result == .SUCCESS)
+    defer {
+        vk.DestroyImage(vk_device, vk_voxel_texture, nil)
+        vk.FreeMemory(vk_device, vk_voxel_memory, nil)
+    }
+
+    vk_voxel_texture_size := vk_voxel_texture_sizes[0]
+    vk_voxel_texture_offset := vk_voxel_texture_offsets[0]
+    delete(vk_voxel_texture_sizes)
+    delete(vk_voxel_texture_offsets)
+
+    assert(bind_resources_to_allocation(vk_device, vk_voxel_memory, { vk_voxel_texture }, {}, { vk_voxel_texture_offset }) == .SUCCESS)
+
+    vk_swapchain_enabled := true
     main_loop: for true {
         event: sdl3.Event
         for sdl3.PollEvent(&event) {
             if event.type == .QUIT {
                 break main_loop
+            } else if event.type == .WINDOW_RESIZED {
+                vk_surface_capabilities, vk_swapchain_enabled = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
             }
         }
 
-        vk.WaitForFences(vk_device, 1, &vk_in_flight_fence, true, max(u64))
+        if vk_swapchain_enabled {
+            vk.WaitForFences(vk_device, 1, &vk_in_flight_fence, true, max(u64))
 
-        vk_image_index: u32
-        vk_result = vk.AcquireNextImageKHR(vk_device, vk_swapchain, max(u64), vk_image_acquisition_semaphore, 0, &vk_image_index)
-        if vk_result == .ERROR_OUT_OF_DATE_KHR {
-            vk_surface_capabilities = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
-            continue
-        } else if vk_result != .SUCCESS && vk_result != .SUBOPTIMAL_KHR {
-            fmt.panicf("Failed to acquire swapchain image: %s", vk_result)
-        }
+            vk_image_index: u32
+            vk_result = vk.AcquireNextImageKHR(vk_device, vk_swapchain, max(u64), vk_image_acquisition_semaphore, 0, &vk_image_index)
+            if vk_result == .ERROR_OUT_OF_DATE_KHR {
+                vk_surface_capabilities, vk_swapchain_enabled = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
+                continue
+            } else if vk_result != .SUCCESS && vk_result != .SUBOPTIMAL_KHR {
+                fmt.panicf("Failed to acquire swapchain image: %s", vk_result)
+            }
 
-        vk.ResetFences(vk_device, 1, &vk_in_flight_fence)
+            vk.ResetFences(vk_device, 1, &vk_in_flight_fence)
 
-        assert(vk.ResetCommandPool(vk_device, vk_command_pool, {}) == .SUCCESS)
-        assert(vk.BeginCommandBuffer(vk_command_buffer, &{
-            sType = .COMMAND_BUFFER_BEGIN_INFO,
-            flags = { .ONE_TIME_SUBMIT },
-        }) == .SUCCESS)
+            assert(vk.ResetCommandPool(vk_device, vk_command_pool, {}) == .SUCCESS)
+            assert(vk.BeginCommandBuffer(vk_command_buffer, &{
+                sType = .COMMAND_BUFFER_BEGIN_INFO,
+                flags = { .ONE_TIME_SUBMIT },
+            }) == .SUCCESS)
 
-        vk.CmdPipelineBarrier(vk_command_buffer,
-            { .TRANSFER }, { .COLOR_ATTACHMENT_OUTPUT }, {},
-            0, nil, 0, nil, 1, & vk.ImageMemoryBarrier {
-            sType = .IMAGE_MEMORY_BARRIER,
-            srcAccessMask = {},
-            dstAccessMask = { .COLOR_ATTACHMENT_WRITE },
-            oldLayout = .UNDEFINED,
-            newLayout = .COLOR_ATTACHMENT_OPTIMAL,
-            image = vk_swapchain_images[vk_image_index],
-            subresourceRange = {
-                aspectMask = { .COLOR },
-                baseMipLevel = 0,
-                levelCount = 1,
-                baseArrayLayer = 0,
+            vk.CmdPipelineBarrier(vk_command_buffer,
+                { .TRANSFER }, { .COLOR_ATTACHMENT_OUTPUT }, {},
+                0, nil, 0, nil, 1, & vk.ImageMemoryBarrier {
+                sType = .IMAGE_MEMORY_BARRIER,
+                srcAccessMask = {},
+                dstAccessMask = { .COLOR_ATTACHMENT_WRITE },
+                oldLayout = .UNDEFINED,
+                newLayout = .COLOR_ATTACHMENT_OPTIMAL,
+                image = vk_swapchain_images[vk_image_index],
+                subresourceRange = {
+                    aspectMask = { .COLOR },
+                    baseMipLevel = 0,
+                    levelCount = 1,
+                    baseArrayLayer = 0,
+                    layerCount = 1,
+                },
+            })
+
+            vk.CmdBeginRenderingKHR(vk_command_buffer, &{
+                sType = .RENDERING_INFO_KHR,
+                renderArea = {
+                    offset = {
+                        x = 0,
+                        y = 0,
+                    },
+                    extent = {
+                        width = vk_surface_capabilities.currentExtent.width,
+                        height = vk_surface_capabilities.currentExtent.height,
+                    },
+                },
                 layerCount = 1,
-            },
-        })
-
-        vk.CmdBeginRenderingKHR(vk_command_buffer, &{
-            sType = .RENDERING_INFO_KHR,
-            renderArea = {
-                offset = {
-                    x = 0,
-                    y = 0,
-                },
-                extent = {
-                    width = vk_surface_capabilities.currentExtent.width,
-                    height = vk_surface_capabilities.currentExtent.height,
-                },
-            },
-            layerCount = 1,
-            viewMask = 0,
-            colorAttachmentCount = 1,
-            pColorAttachments = &vk.RenderingAttachmentInfoKHR {
-                sType = .RENDERING_ATTACHMENT_INFO_KHR,
-                imageView = vk_swapchain_image_views[vk_image_index],
-                imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
-                loadOp = .CLEAR,
-                storeOp = .STORE,
-                clearValue = {
-                    color = {
-                        float32 = { 0.0, 0.3, 0.0, 1.0 },
+                viewMask = 0,
+                colorAttachmentCount = 1,
+                pColorAttachments = &vk.RenderingAttachmentInfoKHR {
+                    sType = .RENDERING_ATTACHMENT_INFO_KHR,
+                    imageView = vk_swapchain_image_views[vk_image_index],
+                    imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
+                    loadOp = .CLEAR,
+                    storeOp = .STORE,
+                    clearValue = {
+                        color = {
+                            float32 = { 0.0, 0.3, 0.0, 1.0 },
+                        }
                     }
-                }
-            },
-        })
+                },
+            })
 
-        vk.CmdEndRenderingKHR(vk_command_buffer)
-        
-        vk.CmdPipelineBarrier(vk_command_buffer,
-            { .COLOR_ATTACHMENT_OUTPUT }, { .TRANSFER }, {},
-            0, nil, 0, nil, 1, & vk.ImageMemoryBarrier {
-            sType = .IMAGE_MEMORY_BARRIER,
-            srcAccessMask = {},
-            dstAccessMask = {},
-            oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
-            newLayout = .PRESENT_SRC_KHR,
-            image = vk_swapchain_images[vk_image_index],
-            subresourceRange = {
-                aspectMask = { .COLOR },
-                baseMipLevel = 0,
-                levelCount = 1,
-                baseArrayLayer = 0,
-                layerCount = 1,
-            },
-        })
-        assert(vk.EndCommandBuffer(vk_command_buffer) == .SUCCESS)
+            vk.CmdEndRenderingKHR(vk_command_buffer)
 
-        wait_stage := vk.PipelineStageFlags { .COLOR_ATTACHMENT_OUTPUT }
-        assert(vk.QueueSubmit(vk_queue, 1, &vk.SubmitInfo {
-            sType = .SUBMIT_INFO,
-            waitSemaphoreCount = 1,
-            pWaitSemaphores = &vk_image_acquisition_semaphore,
-            commandBufferCount = 1,
-            pCommandBuffers = &vk_command_buffer,
-            signalSemaphoreCount = 1,
-            pSignalSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
-            pWaitDstStageMask = &wait_stage,
-        }, vk_in_flight_fence) == .SUCCESS)
+            vk.CmdPipelineBarrier(vk_command_buffer,
+                { .COLOR_ATTACHMENT_OUTPUT }, { .TRANSFER }, {},
+                0, nil, 0, nil, 1, & vk.ImageMemoryBarrier {
+                sType = .IMAGE_MEMORY_BARRIER,
+                srcAccessMask = {},
+                dstAccessMask = {},
+                oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
+                newLayout = .PRESENT_SRC_KHR,
+                image = vk_swapchain_images[vk_image_index],
+                subresourceRange = {
+                    aspectMask = { .COLOR },
+                    baseMipLevel = 0,
+                    levelCount = 1,
+                    baseArrayLayer = 0,
+                    layerCount = 1,
+                },
+            })
+            assert(vk.EndCommandBuffer(vk_command_buffer) == .SUCCESS)
 
-        vk_present_results: vk.Result
-        vk_result = vk.QueuePresentKHR(vk_queue, &{
-            sType = .PRESENT_INFO_KHR,
-            waitSemaphoreCount = 1,
-            pWaitSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
-            swapchainCount = 1,
-            pSwapchains = &vk_swapchain,
-            pImageIndices = &vk_image_index,
-            pResults = &vk_present_results,
-        })
+            wait_stage := vk.PipelineStageFlags { .COLOR_ATTACHMENT_OUTPUT }
+            assert(vk.QueueSubmit(vk_queue, 1, &vk.SubmitInfo {
+                sType = .SUBMIT_INFO,
+                waitSemaphoreCount = 1,
+                pWaitSemaphores = &vk_image_acquisition_semaphore,
+                commandBufferCount = 1,
+                pCommandBuffers = &vk_command_buffer,
+                signalSemaphoreCount = 1,
+                pSignalSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
+                pWaitDstStageMask = &wait_stage,
+            }, vk_in_flight_fence) == .SUCCESS)
 
-        if vk_result == .ERROR_OUT_OF_DATE_KHR || vk_result == .SUBOPTIMAL_KHR {
-            vk_surface_capabilities = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
-        } else if vk_result != .SUCCESS {
-            fmt.panicf("Failed to present: %s", vk_result)
+            vk_present_results: vk.Result
+            vk_result = vk.QueuePresentKHR(vk_queue, &{
+                sType = .PRESENT_INFO_KHR,
+                waitSemaphoreCount = 1,
+                pWaitSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
+                swapchainCount = 1,
+                pSwapchains = &vk_swapchain,
+                pImageIndices = &vk_image_index,
+                pResults = &vk_present_results,
+            })
+
+            if vk_result == .ERROR_OUT_OF_DATE_KHR || vk_result == .SUBOPTIMAL_KHR {
+                vk_surface_capabilities, vk_swapchain_enabled = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
+            } else if vk_result != .SUCCESS {
+                fmt.panicf("Failed to present: %s", vk_result)
+            }
         }
     }
 
