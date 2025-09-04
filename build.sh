@@ -8,6 +8,10 @@ if [ $? == "0" ]; then
         cd "./build"
         lldb "./vulkan"
         cd "../"
+    elif [ "$1" == "renderdoc" ]; then
+        cd "./build"
+        qrenderdoc
+        cd "../"
     fi
 else
     echo "--- Build failed"

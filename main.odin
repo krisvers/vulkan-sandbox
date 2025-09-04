@@ -1,6 +1,7 @@
 package main
 
 import "base:runtime"
+import "base:intrinsics"
 import "core:fmt"
 import vk "vendor:vulkan"
 import "vendor:sdl3"
@@ -99,7 +100,7 @@ resize_swapchain :: proc(
     return vk_surface_capabilites, true
 }
 
-find_memory_type_index :: proc(
+find_memory_type_index_single :: proc(
     vk_physical_device: vk.PhysicalDevice,
     vk_memory_type_bits: u32,
     vk_memory_properties: vk.MemoryPropertyFlags
@@ -116,6 +117,40 @@ find_memory_type_index :: proc(
     return vk.MAX_MEMORY_TYPES
 }
 
+find_memory_type_index_multiple :: proc(
+    vk_physical_device: vk.PhysicalDevice,
+    vk_memory_requirementses: []vk.MemoryRequirements,
+    vk_memory_properties: vk.MemoryPropertyFlags
+) -> u32 {
+    vk_physical_device_memory_properties: vk.PhysicalDeviceMemoryProperties
+    vk.GetPhysicalDeviceMemoryProperties(vk_physical_device, &vk_physical_device_memory_properties)
+
+    for i in 0..<vk_physical_device_memory_properties.memoryTypeCount {
+        if (vk_physical_device_memory_properties.memoryTypes[i].propertyFlags & vk_memory_properties) != vk_memory_properties {
+            continue
+        }
+
+        incompatible := false
+        for r in vk_memory_requirementses {
+            if (r.memoryTypeBits & (1 << i)) == 0 {
+                incompatible = true
+                break
+            }
+        }
+
+        if !incompatible {
+            return i
+        }
+    }
+
+    return vk.MAX_MEMORY_TYPES
+}
+
+find_memory_type_index :: proc {
+    find_memory_type_index_single,
+    find_memory_type_index_multiple,
+}
+
 allocate_for_resources :: proc(
     vk_device: vk.Device,
     vk_physical_device: vk.PhysicalDevice,
@@ -127,26 +162,14 @@ allocate_for_resources :: proc(
     vk_memory_requirementses := make([]vk.MemoryRequirements, len(vk_images) + len(vk_buffers))
     sizes = make([]vk.DeviceSize, len(vk_images) + len(vk_buffers))
     offsets = make([]vk.DeviceSize, len(vk_images) + len(vk_buffers))
-    defer {
-        delete(vk_memory_requirementses)
-    }
+    defer delete(vk_memory_requirementses)
 
     total_size: vk.DeviceSize
     for i in 0..<len(vk_images) {
         vk.GetImageMemoryRequirements(vk_device, vk_images[i], &vk_memory_requirementses[i])
-        ti := find_memory_type_index(vk_physical_device, vk_memory_requirementses[i].memoryTypeBits, vk_memory_properties)
-        if ti == vk.MAX_MEMORY_TYPES {
-            delete(sizes)
-            delete(offsets)
-            return 0, {}, {}, .ERROR_UNKNOWN
-        } else if ti != vk_memory_type_index && i != 0 {
-            delete(sizes)
-            delete(offsets)
-            return 0, {}, {}, .ERROR_FRAGMENTED_POOL
-        }
 
         r := total_size % vk_memory_requirementses[i].alignment
-        total_size = total_size + r == 0 ? 0 : vk_memory_requirementses[i].alignment - r
+        total_size = total_size + (r == 0 ? 0 : vk_memory_requirementses[i].alignment - r)
         offsets[i] = total_size
         sizes[i] = vk_memory_requirementses[i].size
         total_size += sizes[i]
@@ -154,22 +177,19 @@ allocate_for_resources :: proc(
 
     for i in 0..<len(vk_buffers) {
         vk.GetBufferMemoryRequirements(vk_device, vk_buffers[i], &vk_memory_requirementses[i + len(vk_images)])
-        ti := find_memory_type_index(vk_physical_device, vk_memory_requirementses[i + len(vk_images)].memoryTypeBits, vk_memory_properties)
-        if ti == vk.MAX_MEMORY_TYPES {
-            delete(sizes)
-            delete(offsets)
-            return 0, {}, {}, .ERROR_UNKNOWN
-        } else if ti != vk_memory_type_index && i + len(vk_images) != 0 {
-            delete(sizes)
-            delete(offsets)
-            return 0, {}, {}, .ERROR_FRAGMENTED_POOL
-        }
-
+        
         r := total_size % vk_memory_requirementses[i + len(vk_images)].alignment
-        total_size = total_size + r == 0 ? 0 : vk_memory_requirementses[i + len(vk_images)].alignment - r
+        total_size = total_size + (r == 0 ? 0 : vk_memory_requirementses[i + len(vk_images)].alignment - r)
         offsets[i + len(vk_images)] = total_size
         sizes[i + len(vk_images)] = vk_memory_requirementses[i + len(vk_images)].size
         total_size += sizes[i + len(vk_images)]
+    }
+
+    vk_memory_type_index = find_memory_type_index(vk_physical_device, vk_memory_requirementses, vk_memory_properties)
+    if vk_memory_type_index == vk.MAX_MEMORY_TYPES {
+        delete(sizes)
+        delete(offsets)
+        return 0, {}, {}, .ERROR_UNKNOWN
     }
 
     result = vk.AllocateMemory(vk_device, &{
@@ -672,37 +692,351 @@ main :: proc() {
     }, nil, &vk_voxel_texture)
     assert(vk_result == .SUCCESS)
 
-    vk_voxel_memory, vk_voxel_texture_sizes, vk_voxel_texture_offsets, vk_voxel_allocation_result := allocate_for_resources(vk_device, vk_physical_device, { vk_voxel_texture }, {}, { .DEVICE_LOCAL })
-    assert(vk_voxel_allocation_result == .SUCCESS)
-    defer {
-        vk.DestroyImage(vk_device, vk_voxel_texture, nil)
-        vk.FreeMemory(vk_device, vk_voxel_memory, nil)
+    vk_depth_texture: vk.Image
+    vk_result = vk.CreateImage(vk_device, &{
+        sType = .IMAGE_CREATE_INFO,
+        imageType = .D2,
+        format = .D16_UNORM,
+        extent = {
+            width = vk_surface_capabilities.currentExtent.width,
+            height = vk_surface_capabilities.currentExtent.height,
+            depth = 1,
+        },
+        mipLevels = 1,
+        arrayLayers = 1,
+        samples = { ._1 },
+        tiling = .OPTIMAL,
+        usage = { .DEPTH_STENCIL_ATTACHMENT },
+        sharingMode = .EXCLUSIVE,
+        initialLayout = .UNDEFINED
+    }, nil, &vk_depth_texture)
+    assert(vk_result == .SUCCESS)
+
+    vertex_data := [24]f32 {
+        0, 0, 0,
+        0, 0, 1,
+        0, 1, 0,
+        0, 1, 1,
+        1, 0, 0,
+        1, 0, 1,
+        1, 1, 0,
+        1, 1, 1,
     }
 
-    vk_voxel_texture_size := vk_voxel_texture_sizes[0]
-    vk_voxel_texture_offset := vk_voxel_texture_offsets[0]
-    delete(vk_voxel_texture_sizes)
-    delete(vk_voxel_texture_offsets)
+    index_data := [36]u32 {
+        0, 1, 2,
+        1, 3, 2,
+        5, 4, 7,
+        4, 6, 7,
+        4, 0, 6,
+        0, 2, 6,
+        1, 5, 3,
+        5, 7, 3,
+        2, 3, 6,
+        3, 7, 6,
+        4, 5, 0,
+        5, 1, 0,
+    }
 
-    assert(bind_resources_to_allocation(vk_device, vk_voxel_memory, { vk_voxel_texture }, {}, { vk_voxel_texture_offset }) == .SUCCESS)
+    vk_vertex_index_buffer: vk.Buffer
+    vk_result = vk.CreateBuffer(vk_device, &{
+        sType = .BUFFER_CREATE_INFO,
+        size = size_of(vertex_data) + size_of(index_data),
+        usage = { .VERTEX_BUFFER, .INDEX_BUFFER, .TRANSFER_DST },
+    }, nil, &vk_vertex_index_buffer)
+
+    vk_gpu_memory, vk_gpu_memory_sizes, vk_gpu_memory_offsets, vk_gpu_allocation_result := allocate_for_resources(vk_device, vk_physical_device, { vk_voxel_texture, vk_depth_texture }, { vk_vertex_index_buffer }, { .DEVICE_LOCAL })
+    assert(vk_gpu_allocation_result == .SUCCESS)
+    defer {
+        vk.DestroyBuffer(vk_device, vk_vertex_index_buffer, nil)
+        vk.DestroyImage(vk_device, vk_depth_texture, nil)
+        vk.DestroyImage(vk_device, vk_voxel_texture, nil)
+        vk.FreeMemory(vk_device, vk_gpu_memory, nil)
+    }
+
+    vk_voxel_texture_size := vk_gpu_memory_sizes[0]
+    vk_voxel_texture_offset := vk_gpu_memory_offsets[0]
+    vk_depth_texture_size := vk_gpu_memory_sizes[1]
+    vk_depth_texture_offset := vk_gpu_memory_offsets[1]
+    vk_vertex_index_buffer_size := vk_gpu_memory_sizes[2]
+    vk_vertex_index_buffer_offset := vk_gpu_memory_offsets[2]
+
+    assert(bind_resources_to_allocation(vk_device, vk_gpu_memory, { vk_voxel_texture, vk_depth_texture }, { vk_vertex_index_buffer }, vk_gpu_memory_offsets) == .SUCCESS)
+    delete(vk_gpu_memory_sizes)
+    delete(vk_gpu_memory_offsets)
+
+    vk_voxel_texture_view: vk.ImageView
+    vk_result = vk.CreateImageView(vk_device, &{
+        sType = .IMAGE_VIEW_CREATE_INFO,
+        image = vk_voxel_texture,
+        viewType = .D3,
+        format = .R8_UINT,
+        components = {
+            r = .IDENTITY,
+            g = .IDENTITY,
+            b = .IDENTITY,
+            a = .IDENTITY,
+        },
+        subresourceRange = {
+            aspectMask = { .COLOR },
+            baseMipLevel = 0,
+            levelCount = 1,
+            baseArrayLayer = 0,
+            layerCount = 1,
+        }
+    }, nil, &vk_voxel_texture_view)
+    assert(vk_result == .SUCCESS)
+    defer vk.DestroyImageView(vk_device, vk_voxel_texture_view, nil)
+
+    vk_depth_texture_view: vk.ImageView
+    vk_result = vk.CreateImageView(vk_device, &{
+        sType = .IMAGE_VIEW_CREATE_INFO,
+        image = vk_depth_texture,
+        viewType = .D2,
+        format = .D16_UNORM,
+        components = {
+            r = .IDENTITY,
+            g = .IDENTITY,
+            b = .IDENTITY,
+            a = .IDENTITY,
+        },
+        subresourceRange = {
+            aspectMask = { .DEPTH },
+            baseMipLevel = 0,
+            levelCount = 1,
+            baseArrayLayer = 0,
+            layerCount = 1,
+        }
+    }, nil, &vk_depth_texture_view)
+    assert(vk_result == .SUCCESS)
+    defer vk.DestroyImageView(vk_device, vk_depth_texture_view, nil)
+
+    vk_upload_buffer: vk.Buffer
+    vk_result = vk.CreateBuffer(vk_device, &{
+        sType = .BUFFER_CREATE_INFO,
+        size = size_of(vertex_data) + size_of(index_data),
+        usage = { .TRANSFER_SRC },
+    }, nil, &vk_upload_buffer)
+    
+    vk_upload_memory, vk_upload_memory_sizes, vk_upload_memory_offsets, vk_upload_allocation_result := allocate_for_resources(vk_device, vk_physical_device, {}, { vk_upload_buffer }, { .HOST_VISIBLE, .HOST_COHERENT })
+    assert(vk_upload_allocation_result == .SUCCESS)
+    defer {
+        vk.DestroyBuffer(vk_device, vk_upload_buffer, nil)
+        vk.FreeMemory(vk_device, vk_upload_memory, nil)
+    }
+
+    vk_upload_buffer_size := vk_upload_memory_sizes[0]
+    vk_upload_buffer_offset := vk_upload_memory_offsets[0]
+
+    assert(bind_resources_to_allocation(vk_device, vk_upload_memory, {}, { vk_upload_buffer }, vk_upload_memory_offsets) == .SUCCESS)
+    delete(vk_upload_memory_sizes)
+    delete(vk_upload_memory_offsets)
+
+    vk_upload_buffer_mapped_rawptr: rawptr
+    assert(vk.MapMemory(vk_device, vk_upload_memory, vk_upload_buffer_offset, vk_upload_buffer_size, {}, &vk_upload_buffer_mapped_rawptr) == .SUCCESS)
+
+    vk_upload_buffer_mapped := ([^]u8)(vk_upload_buffer_mapped_rawptr)
+    intrinsics.mem_copy_non_overlapping(&vk_upload_buffer_mapped[0], &vertex_data[0], size_of(vertex_data))
+    intrinsics.mem_copy_non_overlapping(&vk_upload_buffer_mapped[size_of(vertex_data)], &index_data[0], size_of(index_data))
+
+    vk.UnmapMemory(vk_device, vk_upload_memory)
+
+    assert(vk.ResetCommandPool(vk_device, vk_command_pool, {}) == .SUCCESS)
+    assert(vk.BeginCommandBuffer(vk_command_buffer, &{
+        sType = .COMMAND_BUFFER_BEGIN_INFO,
+    }) == .SUCCESS)
+
+    vk.CmdCopyBuffer(vk_command_buffer,
+        vk_upload_buffer, vk_vertex_index_buffer,
+        1, &vk.BufferCopy {
+            srcOffset = 0,
+            dstOffset = 0,
+            size = vk_upload_buffer_size,
+        }
+    )
+
+    assert(vk.EndCommandBuffer(vk_command_buffer) == .SUCCESS)
+    assert(vk.QueueSubmit(vk_queue, 1, &vk.SubmitInfo {
+        sType = .SUBMIT_INFO,
+        waitSemaphoreCount = 0,
+        pWaitSemaphores = nil,
+        pWaitDstStageMask = nil,
+        commandBufferCount = 1,
+        pCommandBuffers = &vk_command_buffer,
+        signalSemaphoreCount = 0,
+        pSignalSemaphores = nil,
+    }, 0) == .SUCCESS)
+
+    assert(vk.QueueWaitIdle(vk_queue) == .SUCCESS)
+
+    shader_source_hlsl := cstring(#load("shaders.hlsl"))
+    vk_vertex_shader_module, vk_vertex_shader_compilation_result := compile_hlsl(vk_device, dxc_utils, dxc_compiler, shader_source_hlsl, "vertex_main", { .VERTEX })
+    if vk_vertex_shader_compilation_result != .SUCCESS {
+        fmt.panicf("Failed to compile vertex shader from shaders.hlsl: %s", vk_vertex_shader_compilation_result)
+    }
+    defer vk.DestroyShaderModule(vk_device, vk_vertex_shader_module, nil)
+
+    vk_fragment_shader_module, vk_fragment_shader_compilation_result := compile_hlsl(vk_device, dxc_utils, dxc_compiler, shader_source_hlsl, "fragment_main", { .FRAGMENT })
+    if vk_fragment_shader_compilation_result != .SUCCESS {
+        fmt.panicf("Failed to compile fragment shader from shaders.hlsl: %s", vk_fragment_shader_compilation_result)
+    }
+    defer vk.DestroyShaderModule(vk_device, vk_fragment_shader_module, nil)
+
+    vk_graphics_pipeline_descriptor_set_layout: vk.DescriptorSetLayout
+    vk_result = vk.CreateDescriptorSetLayout(vk_device, &{
+        sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        bindingCount = 1,
+        pBindings = &vk.DescriptorSetLayoutBinding {
+            binding = 0,
+            descriptorType = .STORAGE_IMAGE,
+            descriptorCount = 1,
+            stageFlags = { .FRAGMENT },
+        }
+    }, nil, &vk_graphics_pipeline_descriptor_set_layout)
+    assert(vk_result == .SUCCESS)
+    defer vk.DestroyDescriptorSetLayout(vk_device, vk_graphics_pipeline_descriptor_set_layout, nil)
 
     vk_graphics_pipeline_layout: vk.PipelineLayout
+    vk_result = vk.CreatePipelineLayout(vk_device, &{
+        sType = .PIPELINE_LAYOUT_CREATE_INFO,
+        setLayoutCount = 1,
+        pSetLayouts = &vk_graphics_pipeline_descriptor_set_layout,
+    }, nil, &vk_graphics_pipeline_layout)
+    assert(vk_result == .SUCCESS)
+    defer vk.DestroyPipelineLayout(vk_device, vk_graphics_pipeline_layout, nil)
 
     vk_graphics_pipeline_shader_stages := [2]vk.PipelineShaderStageCreateInfo {
         {
-
+            sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage = { .VERTEX },
+            module = vk_vertex_shader_module,
+            pName = "vertex_main",
         },
         {
+            sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage = { .FRAGMENT },
+            module = vk_fragment_shader_module,
+            pName = "fragment_main",
+        },
+    }
 
-        }
+    vk_graphics_pipeline_dynamic_states := [2]vk.DynamicState {
+        .VIEWPORT,
+        .SCISSOR,
+    }
+
+    vk_graphics_pipeline_color_attachment_formats := [1]vk.Format {
+        .B8G8R8A8_UNORM,
     }
 
     vk_graphics_pipeline: vk.Pipeline
     vk_result = vk.CreateGraphicsPipelines(vk_device, 0, 1, &vk.GraphicsPipelineCreateInfo {
         sType = .GRAPHICS_PIPELINE_CREATE_INFO,
+        pNext = &vk.PipelineRenderingCreateInfoKHR {
+            sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
+            colorAttachmentCount = u32(len(vk_graphics_pipeline_color_attachment_formats)),
+            pColorAttachmentFormats = &vk_graphics_pipeline_color_attachment_formats[0],
+            depthAttachmentFormat = .D16_UNORM,
+            stencilAttachmentFormat = .UNDEFINED,
+        },
         stageCount = 2,
         pStages = &vk_graphics_pipeline_shader_stages[0],
+        pVertexInputState = &{
+            sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            vertexBindingDescriptionCount = 1,
+            pVertexBindingDescriptions = &vk.VertexInputBindingDescription {
+                binding = 0,
+                stride = 3 * size_of(f32),
+                inputRate = .VERTEX,
+            },
+            vertexAttributeDescriptionCount = 1,
+            pVertexAttributeDescriptions = &vk.VertexInputAttributeDescription {
+                location = 0,
+                binding = 0,
+                format = .R32G32B32_SFLOAT,
+            },
+        },
+        pInputAssemblyState = &{
+            sType = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            topology = .TRIANGLE_LIST,
+        },
+        pViewportState = &{
+            sType = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            viewportCount = 1,
+            scissorCount = 1,
+        },
+        pRasterizationState = &{
+            sType = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            polygonMode = .FILL,
+            cullMode = {},
+            frontFace = .COUNTER_CLOCKWISE,
+            lineWidth = 1.0,
+        },
+        pMultisampleState = &{
+            sType = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            rasterizationSamples = { ._1 },
+        },
+        pDepthStencilState = &{
+            sType = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+            depthTestEnable = false,
+            depthWriteEnable = false,
+            depthCompareOp = .LESS_OR_EQUAL,
+            minDepthBounds = 0.0,
+            maxDepthBounds = 1.0,
+        },
+        pColorBlendState = &{
+            sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            attachmentCount = 1,
+            pAttachments = &vk.PipelineColorBlendAttachmentState {
+                blendEnable = false,
+            },
+            blendConstants = { 1.0, 1.0, 1.0, 1.0 },
+        },
+        pDynamicState = &{
+            sType = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            dynamicStateCount = u32(len(vk_graphics_pipeline_dynamic_states)),
+            pDynamicStates = &vk_graphics_pipeline_dynamic_states[0],
+        },
+        layout = vk_graphics_pipeline_layout,
+        renderPass = 0,
     }, nil, &vk_graphics_pipeline)
+    assert(vk_result == .SUCCESS)
+    defer vk.DestroyPipeline(vk_device, vk_graphics_pipeline, nil)
+
+    vk_graphics_pipeline_descriptor_pool: vk.DescriptorPool
+    vk_result = vk.CreateDescriptorPool(vk_device, &{
+        sType = .DESCRIPTOR_POOL_CREATE_INFO,
+        maxSets = 1,
+        poolSizeCount = 1,
+        pPoolSizes = &vk.DescriptorPoolSize {
+            type = .STORAGE_IMAGE,
+            descriptorCount = 1,
+        },
+    }, nil, &vk_graphics_pipeline_descriptor_pool)
+    assert(vk_result == .SUCCESS)
+    defer vk.DestroyDescriptorPool(vk_device, vk_graphics_pipeline_descriptor_pool, nil)
+
+    vk_graphics_pipeline_descriptor_set: vk.DescriptorSet
+    vk_result = vk.AllocateDescriptorSets(vk_device, &{
+        sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
+        descriptorPool = vk_graphics_pipeline_descriptor_pool,
+        descriptorSetCount = 1,
+        pSetLayouts = &vk_graphics_pipeline_descriptor_set_layout,
+    }, &vk_graphics_pipeline_descriptor_set)
+    assert(vk_result == .SUCCESS)
+    
+    vk.UpdateDescriptorSets(vk_device, 1, &vk.WriteDescriptorSet {
+        sType = .WRITE_DESCRIPTOR_SET,
+        dstSet = vk_graphics_pipeline_descriptor_set,
+        dstBinding = 0,
+        dstArrayElement = 0,
+        descriptorCount = 1,
+        descriptorType = .STORAGE_IMAGE,
+        pImageInfo = &{
+            imageView = vk_voxel_texture_view,
+            imageLayout = .GENERAL,
+        },
+    }, 0, nil)
 
     vk_swapchain_enabled := true
     main_loop: for true {
@@ -737,21 +1071,66 @@ main :: proc() {
 
             vk.CmdPipelineBarrier(vk_command_buffer,
                 { .TRANSFER }, { .COLOR_ATTACHMENT_OUTPUT }, {},
-                0, nil, 0, nil, 1, & vk.ImageMemoryBarrier {
-                sType = .IMAGE_MEMORY_BARRIER,
-                srcAccessMask = {},
-                dstAccessMask = { .COLOR_ATTACHMENT_WRITE },
-                oldLayout = .UNDEFINED,
-                newLayout = .COLOR_ATTACHMENT_OPTIMAL,
-                image = vk_swapchain_images[vk_image_index],
-                subresourceRange = {
-                    aspectMask = { .COLOR },
-                    baseMipLevel = 0,
-                    levelCount = 1,
-                    baseArrayLayer = 0,
-                    layerCount = 1,
-                },
-            })
+                0, nil,
+                0, nil,
+                1, &vk.ImageMemoryBarrier {
+                    sType = .IMAGE_MEMORY_BARRIER,
+                    srcAccessMask = {},
+                    dstAccessMask = { .COLOR_ATTACHMENT_WRITE },
+                    oldLayout = .UNDEFINED,
+                    newLayout = .COLOR_ATTACHMENT_OPTIMAL,
+                    image = vk_swapchain_images[vk_image_index],
+                    subresourceRange = {
+                        aspectMask = { .COLOR },
+                        baseMipLevel = 0,
+                        levelCount = 1,
+                        baseArrayLayer = 0,
+                        layerCount = 1,
+                    }
+                }
+            )
+
+            vk.CmdPipelineBarrier(vk_command_buffer,
+                { .BOTTOM_OF_PIPE }, { .EARLY_FRAGMENT_TESTS }, {},
+                0, nil,
+                0, nil,
+                1, &vk.ImageMemoryBarrier {
+                    sType = .IMAGE_MEMORY_BARRIER,
+                    srcAccessMask = {},
+                    dstAccessMask = { .DEPTH_STENCIL_ATTACHMENT_READ, .DEPTH_STENCIL_ATTACHMENT_WRITE },
+                    oldLayout = .UNDEFINED,
+                    newLayout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    image = vk_depth_texture,
+                    subresourceRange = {
+                        aspectMask = { .DEPTH },
+                        baseMipLevel = 0,
+                        levelCount = 1,
+                        baseArrayLayer = 0,
+                        layerCount = 1,
+                    }
+                }
+            )
+
+            vk.CmdPipelineBarrier(vk_command_buffer,
+                { .BOTTOM_OF_PIPE }, { .FRAGMENT_SHADER }, {},
+                0, nil,
+                0, nil,
+                1, &vk.ImageMemoryBarrier {
+                    sType = .IMAGE_MEMORY_BARRIER,
+                    srcAccessMask = {},
+                    dstAccessMask = { .SHADER_READ },
+                    oldLayout = .UNDEFINED,
+                    newLayout = .GENERAL,
+                    image = vk_voxel_texture,
+                    subresourceRange = {
+                        aspectMask = { .COLOR },
+                        baseMipLevel = 0,
+                        levelCount = 1,
+                        baseArrayLayer = 0,
+                        layerCount = 1,
+                    }
+                }
+            )
 
             vk.CmdBeginRenderingKHR(vk_command_buffer, &{
                 sType = .RENDERING_INFO_KHR,
@@ -780,7 +1159,44 @@ main :: proc() {
                         }
                     }
                 },
+                pDepthAttachment = &vk.RenderingAttachmentInfoKHR {
+                    sType = .RENDERING_ATTACHMENT_INFO_KHR,
+                    imageView = vk_depth_texture_view,
+                    imageLayout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    loadOp = .CLEAR,
+                    storeOp = .DONT_CARE,
+                    clearValue = {
+                        depthStencil = {
+                            depth = 1.0,
+                        }
+                    }
+                },
             })
+
+            vk.CmdBindPipeline(vk_command_buffer, .GRAPHICS, vk_graphics_pipeline)
+            vk.CmdBindDescriptorSets(vk_command_buffer, .GRAPHICS, vk_graphics_pipeline_layout, 0, 1, &vk_graphics_pipeline_descriptor_set, 0, nil)
+
+            vk.CmdSetViewport(vk_command_buffer, 0, 1, &vk.Viewport {
+                x = 0,
+                y = 0,
+                width = f32(vk_surface_capabilities.currentExtent.width),
+                height = f32(vk_surface_capabilities.currentExtent.height),
+                minDepth = 0.0,
+                maxDepth = 1.0,
+            })
+
+            vk.CmdSetScissor(vk_command_buffer, 0, 1, &vk.Rect2D {
+                offset = {
+                    x = 0,
+                    y = 0,
+                },
+                extent = vk_surface_capabilities.currentExtent,
+            })
+
+            vk_vertex_offset := vk.DeviceSize(0)
+            vk.CmdBindVertexBuffers(vk_command_buffer, 0, 1, &vk_vertex_index_buffer, &vk_vertex_offset)
+            vk.CmdBindIndexBuffer(vk_command_buffer, vk_vertex_index_buffer, vk.DeviceSize(len(index_data)), .UINT32)
+            vk.CmdDrawIndexed(vk_command_buffer, u32(len(index_data)), 1, 0, 0, 0)
 
             vk.CmdEndRenderingKHR(vk_command_buffer)
 
