@@ -15,64 +15,90 @@ when ODIN_OS == .Darwin {
     foreign import moltenvk "MoltenVK"
 }
 
-resize_swapchain :: proc(  
-    vk_device: vk.Device,
-    vk_physical_device: vk.PhysicalDevice,
-    vk_surface: vk.SurfaceKHR,
-    vk_swapchain: ^vk.SwapchainKHR,
-    vk_swapchain_image_count: ^u32,
-    vk_swapchain_images: ^[dynamic]vk.Image,
-    vk_swapchain_image_views: ^[dynamic]vk.ImageView,
-    vk_swapchain_image_finished_semaphores: ^[dynamic]vk.Semaphore
-) -> (vk.SurfaceCapabilitiesKHR, bool) {
-    assert(vk.DeviceWaitIdle(vk_device) == .SUCCESS)
-    vk_surface_capabilites := vk.SurfaceCapabilitiesKHR {}
-    assert(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, vk_surface, &vk_surface_capabilites) == .SUCCESS)
+UniformData :: struct {
+    mvp_matrix: matrix[4, 4]f32,
+}
 
-    if vk_surface_capabilites.currentExtent.width == 0 || vk_surface_capabilites.currentExtent.height == 0 {
-        return vk_surface_capabilites, false
+MemoryResidentHandle :: union {
+    vk.Image,
+    vk.Buffer,
+}
+
+MemoryResidentID :: struct {
+    handle: MemoryResidentHandle,
+    is_image: bool,
+}
+
+MemoryResident :: struct {
+    id: MemoryResidentID,
+    size: vk.DeviceSize,
+    alignment: vk.DeviceSize,
+    offset: vk.DeviceSize,
+}
+
+MemoryAllocation :: struct {
+    memory: vk.DeviceMemory,
+    size: vk.DeviceSize,
+    residents: map[MemoryResidentID]MemoryResident,
+}
+
+resize_swapchain :: proc(  
+    device: vk.Device,
+    physical_device: vk.PhysicalDevice,
+    surface: vk.SurfaceKHR,
+    swapchain: ^vk.SwapchainKHR,
+    swapchain_image_count: ^u32,
+    swapchain_images: ^[dynamic]vk.Image,
+    swapchain_image_views: ^[dynamic]vk.ImageView,
+    swapchain_image_finished_semaphores: ^[dynamic]vk.Semaphore
+) -> (vk.SurfaceCapabilitiesKHR, bool) {
+    surface_capabilites := vk.SurfaceCapabilitiesKHR {}
+    assert(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &surface_capabilites) == .SUCCESS)
+
+    if surface_capabilites.currentExtent.width == 0 || surface_capabilites.currentExtent.height == 0 {
+        return surface_capabilites, false
     }
 
-    vk_old_swapchain := vk_swapchain^
-    vk_result := vk.CreateSwapchainKHR(vk_device, &{
+    old_swapchain := swapchain^
+    result := vk.CreateSwapchainKHR(device, &{
         sType = .SWAPCHAIN_CREATE_INFO_KHR,
-        surface = vk_surface,
+        surface = surface,
         minImageCount = 3,
         imageFormat = .B8G8R8A8_UNORM,
         imageColorSpace = .SRGB_NONLINEAR,
-        imageExtent = vk_surface_capabilites.currentExtent,
+        imageExtent = surface_capabilites.currentExtent,
         imageArrayLayers = 1,
         imageUsage = { .COLOR_ATTACHMENT },
         imageSharingMode = .EXCLUSIVE,
         preTransform = { .IDENTITY },
         compositeAlpha = { .OPAQUE },
         presentMode = .FIFO,
-        oldSwapchain = vk_old_swapchain,
-    }, nil, vk_swapchain)
-    assert(vk_result == .SUCCESS)
-    vk.DestroySwapchainKHR(vk_device, vk_old_swapchain, nil)
+        oldSwapchain = old_swapchain,
+    }, nil, swapchain)
+    assert(result == .SUCCESS)
+    vk.DestroySwapchainKHR(device, old_swapchain, nil)
 
-    for iv in vk_swapchain_image_views {
-        vk.DestroyImageView(vk_device, iv, nil)
+    for iv in swapchain_image_views {
+        vk.DestroyImageView(device, iv, nil)
     }
 
-    vk_old_swapchain_image_count := vk_swapchain_image_count^
-    assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain^, vk_swapchain_image_count, nil) == .SUCCESS)
+    old_swapchain_image_count := swapchain_image_count^
+    assert(vk.GetSwapchainImagesKHR(device, swapchain^, swapchain_image_count, nil) == .SUCCESS)
 
-    for i in vk_swapchain_image_count^..<vk_old_swapchain_image_count {
-        vk.DestroySemaphore(vk_device, vk_swapchain_image_finished_semaphores^[i], nil)
+    for i in swapchain_image_count^..<old_swapchain_image_count {
+        vk.DestroySemaphore(device, swapchain_image_finished_semaphores^[i], nil)
     }
 
-    resize(vk_swapchain_images, vk_swapchain_image_count^)
-    assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain^, vk_swapchain_image_count, &(vk_swapchain_images^[0])) == .SUCCESS)
+    resize(swapchain_images, swapchain_image_count^)
+    assert(vk.GetSwapchainImagesKHR(device, swapchain^, swapchain_image_count, &(swapchain_images^[0])) == .SUCCESS)
 
-    resize(vk_swapchain_image_views, vk_swapchain_image_count^)
-    resize(vk_swapchain_image_finished_semaphores, vk_swapchain_image_count^)
+    resize(swapchain_image_views, swapchain_image_count^)
+    resize(swapchain_image_finished_semaphores, swapchain_image_count^)
     
-    for i in 0..<vk_swapchain_image_count^ {
-        assert(vk.CreateImageView(vk_device, &{
+    for i in 0..<swapchain_image_count^ {
+        assert(vk.CreateImageView(device, &{
             sType = .IMAGE_VIEW_CREATE_INFO,
-            image = vk_swapchain_images^[i],
+            image = swapchain_images^[i],
             viewType = .D2,
             format = .B8G8R8A8_UNORM,
             components = {
@@ -88,28 +114,28 @@ resize_swapchain :: proc(
                 baseArrayLayer = 0,
                 layerCount = 1,
             },
-        }, nil, &(vk_swapchain_image_views^[i])) == .SUCCESS)
+        }, nil, &(swapchain_image_views^[i])) == .SUCCESS)
     
-        if i >= vk_old_swapchain_image_count {
-            assert(vk.CreateSemaphore(vk_device, &{
+        if i >= old_swapchain_image_count {
+            assert(vk.CreateSemaphore(device, &{
                 sType = .SEMAPHORE_CREATE_INFO,
-            }, nil, &(vk_swapchain_image_finished_semaphores^[i])) == .SUCCESS)
+            }, nil, &(swapchain_image_finished_semaphores^[i])) == .SUCCESS)
         }
     }
 
-    return vk_surface_capabilites, true
+    return surface_capabilites, true
 }
 
 find_memory_type_index_single :: proc(
-    vk_physical_device: vk.PhysicalDevice,
-    vk_memory_type_bits: u32,
-    vk_memory_properties: vk.MemoryPropertyFlags
+    physical_device: vk.PhysicalDevice,
+    memory_type_bits: u32,
+    memory_properties: vk.MemoryPropertyFlags
 ) -> u32 {
-    vk_physical_device_memory_properties: vk.PhysicalDeviceMemoryProperties
-    vk.GetPhysicalDeviceMemoryProperties(vk_physical_device, &vk_physical_device_memory_properties)
+    physical_device_memory_properties: vk.PhysicalDeviceMemoryProperties
+    vk.GetPhysicalDeviceMemoryProperties(physical_device, &physical_device_memory_properties)
 
-    for i in 0..<vk_physical_device_memory_properties.memoryTypeCount {
-        if (vk_memory_type_bits & (1 << i)) != 0 && (vk_physical_device_memory_properties.memoryTypes[i].propertyFlags & vk_memory_properties) == vk_memory_properties {
+    for i in 0..<physical_device_memory_properties.memoryTypeCount {
+        if (memory_type_bits & (1 << i)) != 0 && (physical_device_memory_properties.memoryTypes[i].propertyFlags & memory_properties) == memory_properties {
             return i
         }
     }
@@ -118,20 +144,20 @@ find_memory_type_index_single :: proc(
 }
 
 find_memory_type_index_multiple :: proc(
-    vk_physical_device: vk.PhysicalDevice,
-    vk_memory_requirementses: []vk.MemoryRequirements,
-    vk_memory_properties: vk.MemoryPropertyFlags
+    physical_device: vk.PhysicalDevice,
+    memory_requirementses: []vk.MemoryRequirements,
+    memory_properties: vk.MemoryPropertyFlags
 ) -> u32 {
-    vk_physical_device_memory_properties: vk.PhysicalDeviceMemoryProperties
-    vk.GetPhysicalDeviceMemoryProperties(vk_physical_device, &vk_physical_device_memory_properties)
+    physical_device_memory_properties: vk.PhysicalDeviceMemoryProperties
+    vk.GetPhysicalDeviceMemoryProperties(physical_device, &physical_device_memory_properties)
 
-    for i in 0..<vk_physical_device_memory_properties.memoryTypeCount {
-        if (vk_physical_device_memory_properties.memoryTypes[i].propertyFlags & vk_memory_properties) != vk_memory_properties {
+    for i in 0..<physical_device_memory_properties.memoryTypeCount {
+        if (physical_device_memory_properties.memoryTypes[i].propertyFlags & memory_properties) != memory_properties {
             continue
         }
 
         incompatible := false
-        for r in vk_memory_requirementses {
+        for r in memory_requirementses {
             if (r.memoryTypeBits & (1 << i)) == 0 {
                 incompatible = true
                 break
@@ -151,84 +177,107 @@ find_memory_type_index :: proc {
     find_memory_type_index_multiple,
 }
 
+destroy_allocation :: proc(
+    device: vk.Device,
+    allocation: ^MemoryAllocation
+) {
+    vk.FreeMemory(device, allocation.memory, nil)
+    delete(allocation.residents)
+    
+    allocation.memory = 0
+    allocation.residents = {}
+}
+
 allocate_for_resources :: proc(
-    vk_device: vk.Device,
-    vk_physical_device: vk.PhysicalDevice,
-    vk_images: []vk.Image,
-    vk_buffers: []vk.Buffer,
-    vk_memory_properties: vk.MemoryPropertyFlags
-) -> (memory: vk.DeviceMemory, sizes: []vk.DeviceSize, offsets: []vk.DeviceSize, result: vk.Result) {
-    vk_memory_type_index: u32
-    vk_memory_requirementses := make([]vk.MemoryRequirements, len(vk_images) + len(vk_buffers))
-    sizes = make([]vk.DeviceSize, len(vk_images) + len(vk_buffers))
-    offsets = make([]vk.DeviceSize, len(vk_images) + len(vk_buffers))
-    defer delete(vk_memory_requirementses)
+    device: vk.Device,
+    physical_device: vk.PhysicalDevice,
+    residents: []MemoryResidentID,
+    memory_properties: vk.MemoryPropertyFlags,
+    minimum_size: vk.DeviceSize = 0,
+) -> (allocation: MemoryAllocation, result: vk.Result) {
+    memory_type_index: u32
+    memory_requirementses := make([]vk.MemoryRequirements, len(residents))
+    sizes := make([]vk.DeviceSize, len(residents))
+    offsets := make([]vk.DeviceSize, len(residents))
+    defer delete(memory_requirementses)
 
-    total_size: vk.DeviceSize
-    for i in 0..<len(vk_images) {
-        vk.GetImageMemoryRequirements(vk_device, vk_images[i], &vk_memory_requirementses[i])
+    total_size := vk.DeviceSize(0)
+    for i in 0..<len(residents) {
+        if residents[i].is_image {
+            vk.GetImageMemoryRequirements(device, residents[i].handle.(vk.Image), &memory_requirementses[i])
+        } else {
+            vk.GetBufferMemoryRequirements(device, residents[i].handle.(vk.Buffer), &memory_requirementses[i])
+        }
 
-        r := total_size % vk_memory_requirementses[i].alignment
-        total_size = total_size + (r == 0 ? 0 : vk_memory_requirementses[i].alignment - r)
+        r := total_size % memory_requirementses[i].alignment
+        total_size = total_size + (r == 0 ? 0 : memory_requirementses[i].alignment - r)
         offsets[i] = total_size
-        sizes[i] = vk_memory_requirementses[i].size
+        sizes[i] = memory_requirementses[i].size
         total_size += sizes[i]
     }
 
-    for i in 0..<len(vk_buffers) {
-        vk.GetBufferMemoryRequirements(vk_device, vk_buffers[i], &vk_memory_requirementses[i + len(vk_images)])
-        
-        r := total_size % vk_memory_requirementses[i + len(vk_images)].alignment
-        total_size = total_size + (r == 0 ? 0 : vk_memory_requirementses[i + len(vk_images)].alignment - r)
-        offsets[i + len(vk_images)] = total_size
-        sizes[i + len(vk_images)] = vk_memory_requirementses[i + len(vk_images)].size
-        total_size += sizes[i + len(vk_images)]
-    }
-
-    vk_memory_type_index = find_memory_type_index(vk_physical_device, vk_memory_requirementses, vk_memory_properties)
-    if vk_memory_type_index == vk.MAX_MEMORY_TYPES {
+    total_size = max(total_size, minimum_size)
+    memory_type_index = find_memory_type_index(physical_device, memory_requirementses, memory_properties)
+    if memory_type_index == vk.MAX_MEMORY_TYPES {
         delete(sizes)
         delete(offsets)
-        return 0, {}, {}, .ERROR_UNKNOWN
+        return {}, .ERROR_UNKNOWN
     }
 
-    result = vk.AllocateMemory(vk_device, &{
+    memory: vk.DeviceMemory
+    result = vk.AllocateMemory(device, &{
         sType = .MEMORY_ALLOCATE_INFO,
         allocationSize = total_size,
-        memoryTypeIndex = vk_memory_type_index,
+        memoryTypeIndex = memory_type_index,
     }, nil, &memory)
 
     if result != .SUCCESS {
         delete(sizes)
         delete(offsets)
-        return 0, {}, {}, result
+        return {}, result
+    }
+
+    allocation = MemoryAllocation {
+        memory = memory,
+        size = total_size,
+        residents = make(map[MemoryResidentID]MemoryResident),
+    }
+
+    for i in 0..<len(residents) {
+        allocation.residents[residents[i]] = {
+            id = residents[i],
+            size = sizes[i],
+            alignment = memory_requirementses[i].alignment,
+            offset = offsets[i],
+        }
+    }
+
+    return allocation, .SUCCESS
+}
+
+bind_resources_to_allocation_auto :: proc(
+    device: vk.Device,
+    allocation: MemoryAllocation,
+) -> (result := vk.Result.SUCCESS) {
+    for id, resident in allocation.residents {
+        r: vk.Result
+        if resident.id.is_image {
+            r = vk.BindImageMemory(device, resident.id.handle.(vk.Image), allocation.memory, resident.offset)
+        } else {
+            r = vk.BindBufferMemory(device, resident.id.handle.(vk.Buffer), allocation.memory, resident.offset)
+        }
+
+        if r != .SUCCESS {
+            result = r
+        }
     }
 
     return
 }
 
-bind_resources_to_allocation :: proc(
-    vk_device: vk.Device,
-    vk_memory: vk.DeviceMemory,
-    vk_images: []vk.Image,
-    vk_buffers: []vk.Buffer,
-    offsets: []vk.DeviceSize
-) -> (result := vk.Result.SUCCESS) {
-    for i in 0..<len(vk_images) {
-        r := vk.BindImageMemory(vk_device, vk_images[i], vk_memory, offsets[i])
-        if r != .SUCCESS {
-            result = r
-        }
-    }
-
-    for i in 0..<len(vk_buffers) {
-        r := vk.BindBufferMemory(vk_device, vk_buffers[i], vk_memory, offsets[i + len(vk_images)])
-        if r != .SUCCESS {
-            result = r
-        }
-    }
-
-    return
+bind_resources_to_allocation :: proc {
+    bind_resources_to_allocation_auto,
+    /* bind_resources_to_allocation_manual, */ 
 }
 
 when ODIN_OS == .Windows {
@@ -250,7 +299,7 @@ when ODIN_OS == .Windows {
 }
 
 compile_hlsl :: proc(
-    vk_device: vk.Device,
+    device: vk.Device,
     dxc_utils: ^dxc.IUtils,
     dxc_compiler: ^dxc.ICompiler,
     source: cstring,
@@ -370,7 +419,7 @@ compile_hlsl :: proc(
     spirv_size := int(dxc_blob->GetBufferSize())
     spirv_code := ([^]u32)(dxc_blob->GetBufferPointer())
 
-    result = vk.CreateShaderModule(vk_device, &{
+    result = vk.CreateShaderModule(device, &{
         sType = .SHADER_MODULE_CREATE_INFO,
         codeSize = spirv_size,
         pCode = spirv_code
@@ -395,46 +444,46 @@ main :: proc() {
     assert(dxc.CreateInstance(dxc.Compiler_CLSID, dxc.ICompiler_UUID, &dxc_compiler) == 0)
     defer dxc_compiler->Release()
 
-    sdl_vk_proc_addr := sdl3.Vulkan_GetVkGetInstanceProcAddr()
-    assert(sdl_vk_proc_addr != nil)
+    sdl_proc_addr := sdl3.Vulkan_GetVkGetInstanceProcAddr()
+    assert(sdl_proc_addr != nil)
 
-    vk.load_proc_addresses_global(rawptr(sdl_vk_proc_addr))
+    vk.load_proc_addresses_global(rawptr(sdl_proc_addr))
     assert(vk.CreateInstance != nil)
 
     sdl_extension_count: u32
     sdl_extensions := sdl3.Vulkan_GetInstanceExtensions(&sdl_extension_count)
     assert(sdl_extensions != nil)
 
-    vk_available_instance_extension_count: u32
-    assert(vk.EnumerateInstanceExtensionProperties(nil, &vk_available_instance_extension_count, nil) == .SUCCESS)
+    available_instance_extension_count: u32
+    assert(vk.EnumerateInstanceExtensionProperties(nil, &available_instance_extension_count, nil) == .SUCCESS)
 
-    vk_available_instance_extensions := []vk.ExtensionProperties {}
-    if vk_available_instance_extension_count > 0 {
-        vk_available_instance_extensions = make([]vk.ExtensionProperties, vk_available_instance_extension_count)
-        assert(vk.EnumerateInstanceExtensionProperties(nil, &vk_available_instance_extension_count, &vk_available_instance_extensions[0]) == .SUCCESS)
+    available_instance_extensions := []vk.ExtensionProperties {}
+    if available_instance_extension_count > 0 {
+        available_instance_extensions = make([]vk.ExtensionProperties, available_instance_extension_count)
+        assert(vk.EnumerateInstanceExtensionProperties(nil, &available_instance_extension_count, &available_instance_extensions[0]) == .SUCCESS)
     }
 
-    vk_instance_extensions := make([dynamic]cstring, 0, sdl_extension_count + 1)
+    instance_extensions := make([dynamic]cstring, 0, sdl_extension_count + 1)
     for i in 0..<sdl_extension_count {
-        append(&vk_instance_extensions, sdl_extensions[i])
+        append(&instance_extensions, sdl_extensions[i])
     }
 
-    append(&vk_instance_extensions, "VK_EXT_debug_utils")
+    append(&instance_extensions, "EXT_debug_utils")
 
-    vk_instance_flags := vk.InstanceCreateFlags {}
+    instance_flags := vk.InstanceCreateFlags {}
     when ODIN_OS == .Darwin {
-        vk_instance_flags |= { .ENUMERATE_PORTABILITY_KHR }
+        instance_flags |= { .ENUMERATE_PORTABILITY_KHR }
     }
 
-    vk_instance_layers := make([dynamic]cstring, 0, 1)
+    instance_layers := make([dynamic]cstring, 0, 1)
     when ODIN_DEBUG {
-        append(&vk_instance_layers, "VK_LAYER_KHRONOS_validation")
+        append(&instance_layers, "LAYER_KHRONOS_validation")
     }
 
-    vk_instance: vk.Instance
-    vk_result := vk.CreateInstance(&{
+    instance: vk.Instance
+    result := vk.CreateInstance(&{
         sType = .INSTANCE_CREATE_INFO,
-        flags = vk_instance_flags,
+        flags = instance_flags,
         pApplicationInfo = &{
             pApplicationName = "vulkan",
             applicationVersion = vk.MAKE_VERSION(1, 0, 0),
@@ -442,20 +491,20 @@ main :: proc() {
             engineVersion = vk.MAKE_VERSION(1, 0, 0),
             apiVersion = vk.API_VERSION_1_2,
         },
-        enabledLayerCount = u32(len(vk_instance_layers)),
-        ppEnabledLayerNames = len(vk_instance_layers) == 0 ? nil : &vk_instance_layers[0],
-        enabledExtensionCount = u32(len(vk_instance_extensions)),
-        ppEnabledExtensionNames = &vk_instance_extensions[0]
-    }, nil, &vk_instance)
-    delete(vk_instance_extensions)
-    delete(vk_available_instance_extensions)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyInstance(vk_instance, nil)
+        enabledLayerCount = u32(len(instance_layers)),
+        ppEnabledLayerNames = len(instance_layers) == 0 ? nil : &instance_layers[0],
+        enabledExtensionCount = u32(len(instance_extensions)),
+        ppEnabledExtensionNames = &instance_extensions[0]
+    }, nil, &instance)
+    delete(instance_extensions)
+    delete(available_instance_extensions)
+    assert(result == .SUCCESS)
+    defer vk.DestroyInstance(instance, nil)
 
-    vk.load_proc_addresses_instance(vk_instance)
+    vk.load_proc_addresses_instance(instance)
     
-    vk_debug_utils_messenger: vk.DebugUtilsMessengerEXT
-    vk_result = vk.CreateDebugUtilsMessengerEXT(vk_instance, &{
+    debug_utils_messenger: vk.DebugUtilsMessengerEXT
+    result = vk.CreateDebugUtilsMessengerEXT(instance, &{
         sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
         messageSeverity = { .ERROR, .WARNING },
         messageType = { .GENERAL, .VALIDATION, .PERFORMANCE },
@@ -465,96 +514,96 @@ main :: proc() {
             return false
         },
         pUserData = nil
-    }, nil, &vk_debug_utils_messenger)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyDebugUtilsMessengerEXT(vk_instance, vk_debug_utils_messenger, nil)
+    }, nil, &debug_utils_messenger)
+    assert(result == .SUCCESS)
+    defer vk.DestroyDebugUtilsMessengerEXT(instance, debug_utils_messenger, nil)
 
     window := sdl3.CreateWindow("voxels", 1200, 900, { .VULKAN, .RESIZABLE })
     assert(window != nil)
     defer sdl3.DestroyWindow(window)
 
-    vk_surface: vk.SurfaceKHR
-    assert(sdl3.Vulkan_CreateSurface(window, vk_instance, nil, &vk_surface))
-    defer sdl3.Vulkan_DestroySurface(vk_instance, vk_surface, nil)
+    surface: vk.SurfaceKHR
+    assert(sdl3.Vulkan_CreateSurface(window, instance, nil, &surface))
+    defer sdl3.Vulkan_DestroySurface(instance, surface, nil)
 
-    vk_physical_device_count: u32
-    assert(vk.EnumeratePhysicalDevices(vk_instance, &vk_physical_device_count, nil) == .SUCCESS)
+    physical_device_count: u32
+    assert(vk.EnumeratePhysicalDevices(instance, &physical_device_count, nil) == .SUCCESS)
 
-    vk_physical_devices := make([]vk.PhysicalDevice, vk_physical_device_count)
-    assert(vk.EnumeratePhysicalDevices(vk_instance, &vk_physical_device_count, &vk_physical_devices[0]) == .SUCCESS)
+    physical_devices := make([]vk.PhysicalDevice, physical_device_count)
+    assert(vk.EnumeratePhysicalDevices(instance, &physical_device_count, &physical_devices[0]) == .SUCCESS)
 
-    vk_physical_device := vk_physical_devices[0]
-    delete(vk_physical_devices)
+    physical_device := physical_devices[0]
+    delete(physical_devices)
 
-    vk_available_device_extension_count: u32
-    assert(vk.EnumerateDeviceExtensionProperties(vk_physical_device, nil, &vk_available_device_extension_count, nil) == .SUCCESS)
+    available_device_extension_count: u32
+    assert(vk.EnumerateDeviceExtensionProperties(physical_device, nil, &available_device_extension_count, nil) == .SUCCESS)
 
-    vk_available_device_extensions := make([]vk.ExtensionProperties, vk_available_device_extension_count)
-    assert(vk.EnumerateDeviceExtensionProperties(vk_physical_device, nil, &vk_available_device_extension_count, &vk_available_device_extensions[0]) == .SUCCESS)
+    available_device_extensions := make([]vk.ExtensionProperties, available_device_extension_count)
+    assert(vk.EnumerateDeviceExtensionProperties(physical_device, nil, &available_device_extension_count, &available_device_extensions[0]) == .SUCCESS)
     
-    vk_device_extensions := make([dynamic]cstring, 2, 8)
-    vk_device_extensions[0] = "VK_KHR_swapchain"
-    vk_device_extensions[1] = "VK_KHR_dynamic_rendering"
+    device_extensions := make([dynamic]cstring, 2, 8)
+    device_extensions[0] = "KHR_swapchain"
+    device_extensions[1] = "KHR_dynamic_rendering"
 
-    vk_pnext := rawptr(nil)
+    pnext := rawptr(nil)
 
-    found_vk_ext_memory_priority := false
-    found_vk_ext_pageable_device_local_memory := false
-    found_vk_khr_dynamic_rendering := false
+    found_ext_memory_priority := false
+    found_ext_pageable_device_local_memory := false
+    found_khr_dynamic_rendering := false
 
-    vk_pageable_device_local_memory_features := vk.PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT {
+    pageable_device_local_memory_features := vk.PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT {
         sType = .PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT,
         pageableDeviceLocalMemory = true,
     }
 
-    vk_memory_priority_features := vk.PhysicalDeviceMemoryPriorityFeaturesEXT {
+    memory_priority_features := vk.PhysicalDeviceMemoryPriorityFeaturesEXT {
         sType = .PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
         memoryPriority = true,
     }
 
-    vk_dynamic_rendering_features := vk.PhysicalDeviceDynamicRenderingFeaturesKHR {
+    dynamic_rendering_features := vk.PhysicalDeviceDynamicRenderingFeaturesKHR {
         sType = .PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
         dynamicRendering = true,
     }
 
-    for &p in vk_available_device_extensions {
-        if cstring(&p.extensionName[0]) == "VK_EXT_pageable_device_local_memory" {
-            found_vk_ext_pageable_device_local_memory = true
-        } else if cstring(&p.extensionName[0]) == "VK_EXT_memory_priority" {
-            found_vk_ext_memory_priority = true
-        } else if cstring(&p.extensionName[0]) == "VK_KHR_dynamic_rendering" {
-            found_vk_khr_dynamic_rendering = true
+    for &p in available_device_extensions {
+        if cstring(&p.extensionName[0]) == "EXT_pageable_device_local_memory" {
+            found_ext_pageable_device_local_memory = true
+        } else if cstring(&p.extensionName[0]) == "EXT_memory_priority" {
+            found_ext_memory_priority = true
+        } else if cstring(&p.extensionName[0]) == "KHR_dynamic_rendering" {
+            found_khr_dynamic_rendering = true
         }
     }
 
-    if found_vk_ext_memory_priority && found_vk_ext_pageable_device_local_memory {
-        append(&vk_device_extensions, "VK_EXT_memory_priority")
-        vk_memory_priority_features.pNext = vk_pnext
+    if found_ext_memory_priority && found_ext_pageable_device_local_memory {
+        append(&device_extensions, "EXT_memory_priority")
+        memory_priority_features.pNext = pnext
 
-        append(&vk_device_extensions, "VK_EXT_pageable_device_local_memory")
-        vk_pageable_device_local_memory_features.pNext = &vk_memory_priority_features
-        vk_pnext = &vk_pageable_device_local_memory_features
+        append(&device_extensions, "EXT_pageable_device_local_memory")
+        pageable_device_local_memory_features.pNext = &memory_priority_features
+        pnext = &pageable_device_local_memory_features
     }
 
-    if found_vk_khr_dynamic_rendering {
-        append(&vk_device_extensions, "VK_KHR_dynamic_rendering")
-        vk_dynamic_rendering_features.pNext = vk_pnext
-        vk_pnext = &vk_dynamic_rendering_features
+    if found_khr_dynamic_rendering {
+        append(&device_extensions, "KHR_dynamic_rendering")
+        dynamic_rendering_features.pNext = pnext
+        pnext = &dynamic_rendering_features
     }
 
     when ODIN_OS == .Darwin {
-        append(&vk_device_extensions, "VK_KHR_portability_subset")
+        append(&device_extensions, "KHR_portability_subset")
     }
 
     queue_priority := f32(1.0)
 
-    vk_available_physical_device_features, vk_physical_device_features := vk.PhysicalDeviceFeatures {}, vk.PhysicalDeviceFeatures {}
-    vk.GetPhysicalDeviceFeatures(vk_physical_device, &vk_available_physical_device_features)
+    available_physical_device_features, physical_device_features := vk.PhysicalDeviceFeatures {}, vk.PhysicalDeviceFeatures {}
+    vk.GetPhysicalDeviceFeatures(physical_device, &available_physical_device_features)
 
-    vk_device: vk.Device
-    vk_result = vk.CreateDevice(vk_physical_device, &{
+    device: vk.Device
+    result = vk.CreateDevice(physical_device, &{
         sType = .DEVICE_CREATE_INFO,
-        pNext = vk_pnext,
+        pNext = pnext,
         queueCreateInfoCount = 1,
         pQueueCreateInfos = &vk.DeviceQueueCreateInfo {
             sType = .DEVICE_QUEUE_CREATE_INFO,
@@ -562,69 +611,69 @@ main :: proc() {
             queueCount = 1,
             pQueuePriorities = &queue_priority,
         },
-        enabledExtensionCount = u32(len(vk_device_extensions)),
-        ppEnabledExtensionNames = &vk_device_extensions[0],
-        pEnabledFeatures = &vk_physical_device_features,
-    }, nil, &vk_device)
-    delete(vk_device_extensions)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyDevice(vk_device, nil)
+        enabledExtensionCount = u32(len(device_extensions)),
+        ppEnabledExtensionNames = &device_extensions[0],
+        pEnabledFeatures = &physical_device_features,
+    }, nil, &device)
+    delete(device_extensions)
+    assert(result == .SUCCESS)
+    defer vk.DestroyDevice(device, nil)
 
-    vk_queue: vk.Queue
-    vk.GetDeviceQueue(vk_device, 0, 0, &vk_queue)
+    queue: vk.Queue
+    vk.GetDeviceQueue(device, 0, 0, &queue)
     
-    vk_command_pool: vk.CommandPool
-    vk_result = vk.CreateCommandPool(vk_device, &{
+    command_pool: vk.CommandPool
+    result = vk.CreateCommandPool(device, &{
         sType = .COMMAND_POOL_CREATE_INFO,
         flags = {},
         queueFamilyIndex = 0,
-    }, nil, &vk_command_pool)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyCommandPool(vk_device, vk_command_pool, nil)
+    }, nil, &command_pool)
+    assert(result == .SUCCESS)
+    defer vk.DestroyCommandPool(device, command_pool, nil)
 
-    vk_command_buffer: vk.CommandBuffer
-    vk_result = vk.AllocateCommandBuffers(vk_device, &{
+    command_buffer: vk.CommandBuffer
+    result = vk.AllocateCommandBuffers(device, &{
         sType = .COMMAND_BUFFER_ALLOCATE_INFO,
-        commandPool = vk_command_pool,
+        commandPool = command_pool,
         level = .PRIMARY,
         commandBufferCount = 1,
-    }, &vk_command_buffer)
-    assert(vk_result == .SUCCESS)
-    defer vk.FreeCommandBuffers(vk_device, vk_command_pool, 1, &vk_command_buffer)
+    }, &command_buffer)
+    assert(result == .SUCCESS)
+    defer vk.FreeCommandBuffers(device, command_pool, 1, &command_buffer)
 
-    vk_surface_capabilities: vk.SurfaceCapabilitiesKHR
-    assert(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device, vk_surface, &vk_surface_capabilities) == .SUCCESS)
+    surface_capabilities: vk.SurfaceCapabilitiesKHR
+    assert(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &surface_capabilities) == .SUCCESS)
 
-    vk_swapchain: vk.SwapchainKHR
-    vk_result = vk.CreateSwapchainKHR(vk_device, &{
+    swapchain: vk.SwapchainKHR
+    result = vk.CreateSwapchainKHR(device, &{
         sType = .SWAPCHAIN_CREATE_INFO_KHR,
-        surface = vk_surface,
+        surface = surface,
         minImageCount = 3,
         imageFormat = .B8G8R8A8_UNORM,
         imageColorSpace = .SRGB_NONLINEAR,
-        imageExtent = vk_surface_capabilities.currentExtent,
+        imageExtent = surface_capabilities.currentExtent,
         imageArrayLayers = 1,
         imageUsage = { .COLOR_ATTACHMENT },
         imageSharingMode = .EXCLUSIVE,
-        preTransform = vk_surface_capabilities.currentTransform,
+        preTransform = surface_capabilities.currentTransform,
         compositeAlpha = { .OPAQUE },
         presentMode = .FIFO,
-    }, nil, &vk_swapchain)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroySwapchainKHR(vk_device, vk_swapchain, nil)
+    }, nil, &swapchain)
+    assert(result == .SUCCESS)
+    defer vk.DestroySwapchainKHR(device, swapchain, nil)
 
-    vk_swapchain_image_count: u32
-    assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain, &vk_swapchain_image_count, nil) == .SUCCESS)
+    swapchain_image_count: u32
+    assert(vk.GetSwapchainImagesKHR(device, swapchain, &swapchain_image_count, nil) == .SUCCESS)
 
-    vk_swapchain_images := make([dynamic]vk.Image, vk_swapchain_image_count)
-    assert(vk.GetSwapchainImagesKHR(vk_device, vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images[0]) == .SUCCESS)
+    swapchain_images := make([dynamic]vk.Image, swapchain_image_count)
+    assert(vk.GetSwapchainImagesKHR(device, swapchain, &swapchain_image_count, &swapchain_images[0]) == .SUCCESS)
 
-    vk_swapchain_image_views := make([dynamic]vk.ImageView, vk_swapchain_image_count)
-    vk_swapchain_image_finished_semaphores := make([dynamic]vk.Semaphore, vk_swapchain_image_count)
-    for i in 0..<vk_swapchain_image_count {
-        assert(vk.CreateImageView(vk_device, &{
+    swapchain_image_views := make([dynamic]vk.ImageView, swapchain_image_count)
+    swapchain_image_finished_semaphores := make([dynamic]vk.Semaphore, swapchain_image_count)
+    for i in 0..<swapchain_image_count {
+        assert(vk.CreateImageView(device, &{
             sType = .IMAGE_VIEW_CREATE_INFO,
-            image = vk_swapchain_images[i],
+            image = swapchain_images[i],
             viewType = .D2,
             format = .B8G8R8A8_UNORM,
             components = {
@@ -640,40 +689,40 @@ main :: proc() {
                 baseArrayLayer = 0,
                 layerCount = 1,
             },
-        }, nil, &vk_swapchain_image_views[i]) == .SUCCESS)
+        }, nil, &swapchain_image_views[i]) == .SUCCESS)
 
-        assert(vk.CreateSemaphore(vk_device, &{
+        assert(vk.CreateSemaphore(device, &{
             sType = .SEMAPHORE_CREATE_INFO,
-        }, nil, &vk_swapchain_image_finished_semaphores[i]) == .SUCCESS)
+        }, nil, &swapchain_image_finished_semaphores[i]) == .SUCCESS)
     }
 
     defer {
-        for i in 0..<vk_swapchain_image_count {
-            vk.DestroyImageView(vk_device, vk_swapchain_image_views[i], nil)
-            vk.DestroySemaphore(vk_device, vk_swapchain_image_finished_semaphores[i], nil)
+        for i in 0..<swapchain_image_count {
+            vk.DestroyImageView(device, swapchain_image_views[i], nil)
+            vk.DestroySemaphore(device, swapchain_image_finished_semaphores[i], nil)
         }
 
-        delete(vk_swapchain_image_views)
-        delete(vk_swapchain_image_finished_semaphores)
+        delete(swapchain_image_views)
+        delete(swapchain_image_finished_semaphores)
     }
     
-    vk_image_acquisition_semaphore: vk.Semaphore
-    vk_result = vk.CreateSemaphore(vk_device, &{
+    image_acquisition_semaphore: vk.Semaphore
+    result = vk.CreateSemaphore(device, &{
         sType = .SEMAPHORE_CREATE_INFO,
-    }, nil, &vk_image_acquisition_semaphore)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroySemaphore(vk_device, vk_image_acquisition_semaphore, nil)
+    }, nil, &image_acquisition_semaphore)
+    assert(result == .SUCCESS)
+    defer vk.DestroySemaphore(device, image_acquisition_semaphore, nil)
 
-    vk_in_flight_fence: vk.Fence
-    vk_result = vk.CreateFence(vk_device, &{
+    in_flight_fence: vk.Fence
+    result = vk.CreateFence(device, &{
         sType = .FENCE_CREATE_INFO,
         flags = { .SIGNALED },
-    }, nil, &vk_in_flight_fence)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyFence(vk_device, vk_in_flight_fence, nil)
+    }, nil, &in_flight_fence)
+    assert(result == .SUCCESS)
+    defer vk.DestroyFence(device, in_flight_fence, nil)
 
-    vk_voxel_texture: vk.Image
-    vk_result = vk.CreateImage(vk_device, &{
+    voxel_texture: vk.Image
+    result = vk.CreateImage(device, &{
         sType = .IMAGE_CREATE_INFO,
         imageType = .D3,
         format = .R8_UINT,
@@ -689,28 +738,8 @@ main :: proc() {
         usage = { .STORAGE },
         sharingMode = .EXCLUSIVE,
         initialLayout = .UNDEFINED,
-    }, nil, &vk_voxel_texture)
-    assert(vk_result == .SUCCESS)
-
-    vk_depth_texture: vk.Image
-    vk_result = vk.CreateImage(vk_device, &{
-        sType = .IMAGE_CREATE_INFO,
-        imageType = .D2,
-        format = .D16_UNORM,
-        extent = {
-            width = vk_surface_capabilities.currentExtent.width,
-            height = vk_surface_capabilities.currentExtent.height,
-            depth = 1,
-        },
-        mipLevels = 1,
-        arrayLayers = 1,
-        samples = { ._1 },
-        tiling = .OPTIMAL,
-        usage = { .DEPTH_STENCIL_ATTACHMENT },
-        sharingMode = .EXCLUSIVE,
-        initialLayout = .UNDEFINED
-    }, nil, &vk_depth_texture)
-    assert(vk_result == .SUCCESS)
+    }, nil, &voxel_texture)
+    assert(result == .SUCCESS)
 
     vertex_data := [24]f32 {
         0, 0, 0,
@@ -738,37 +767,50 @@ main :: proc() {
         5, 1, 0,
     }
 
-    vk_vertex_index_buffer: vk.Buffer
-    vk_result = vk.CreateBuffer(vk_device, &{
+    vertex_buffer: vk.Buffer
+    result = vk.CreateBuffer(device, &{
         sType = .BUFFER_CREATE_INFO,
-        size = size_of(vertex_data) + size_of(index_data),
-        usage = { .VERTEX_BUFFER, .INDEX_BUFFER, .TRANSFER_DST },
-    }, nil, &vk_vertex_index_buffer)
+        size = size_of(vertex_data),
+        usage = { .VERTEX_BUFFER, .TRANSFER_DST },
+    }, nil, &vertex_buffer)
 
-    vk_gpu_memory, vk_gpu_memory_sizes, vk_gpu_memory_offsets, vk_gpu_allocation_result := allocate_for_resources(vk_device, vk_physical_device, { vk_voxel_texture, vk_depth_texture }, { vk_vertex_index_buffer }, { .DEVICE_LOCAL })
-    assert(vk_gpu_allocation_result == .SUCCESS)
-    defer {
-        vk.DestroyBuffer(vk_device, vk_vertex_index_buffer, nil)
-        vk.DestroyImage(vk_device, vk_depth_texture, nil)
-        vk.DestroyImage(vk_device, vk_voxel_texture, nil)
-        vk.FreeMemory(vk_device, vk_gpu_memory, nil)
+    index_buffer: vk.Buffer
+    result = vk.CreateBuffer(device, &{
+        sType = .BUFFER_CREATE_INFO,
+        size = size_of(index_data),
+        usage = { .INDEX_BUFFER, .TRANSFER_DST },
+    }, nil, &index_buffer)
+
+    gpu_resource_allocation_residents := []MemoryResidentID {
+        {
+            handle = vertex_buffer,
+            is_image = false,
+        },
+        {
+            handle = index_buffer,
+            is_image = false,
+        },
+        {
+            handle = voxel_texture,
+            is_image = true,
+        },
     }
 
-    vk_voxel_texture_size := vk_gpu_memory_sizes[0]
-    vk_voxel_texture_offset := vk_gpu_memory_offsets[0]
-    vk_depth_texture_size := vk_gpu_memory_sizes[1]
-    vk_depth_texture_offset := vk_gpu_memory_offsets[1]
-    vk_vertex_index_buffer_size := vk_gpu_memory_sizes[2]
-    vk_vertex_index_buffer_offset := vk_gpu_memory_offsets[2]
+    gpu_asset_allocation, gpu_asset_allocation_result := allocate_for_resources(device, physical_device, gpu_resource_allocation_residents, { .DEVICE_LOCAL })
+    assert(gpu_asset_allocation_result == .SUCCESS)
+    defer {
+        vk.DestroyBuffer(device, index_buffer, nil)
+        vk.DestroyBuffer(device, vertex_buffer, nil)
+        vk.DestroyImage(device, voxel_texture, nil)
+        destroy_allocation(device, &gpu_asset_allocation)
+    }
 
-    assert(bind_resources_to_allocation(vk_device, vk_gpu_memory, { vk_voxel_texture, vk_depth_texture }, { vk_vertex_index_buffer }, vk_gpu_memory_offsets) == .SUCCESS)
-    delete(vk_gpu_memory_sizes)
-    delete(vk_gpu_memory_offsets)
+    assert(bind_resources_to_allocation(device, gpu_asset_allocation) == .SUCCESS)
 
-    vk_voxel_texture_view: vk.ImageView
-    vk_result = vk.CreateImageView(vk_device, &{
+    voxel_texture_view: vk.ImageView
+    result = vk.CreateImageView(device, &{
         sType = .IMAGE_VIEW_CREATE_INFO,
-        image = vk_voxel_texture,
+        image = voxel_texture,
         viewType = .D3,
         format = .R8_UINT,
         components = {
@@ -784,14 +826,53 @@ main :: proc() {
             baseArrayLayer = 0,
             layerCount = 1,
         }
-    }, nil, &vk_voxel_texture_view)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyImageView(vk_device, vk_voxel_texture_view, nil)
+    }, nil, &voxel_texture_view)
+    assert(result == .SUCCESS)
+    defer vk.DestroyImageView(device, voxel_texture_view, nil)
 
-    vk_depth_texture_view: vk.ImageView
-    vk_result = vk.CreateImageView(vk_device, &{
+    depth_texture: vk.Image
+    result = vk.CreateImage(device, &{
+        sType = .IMAGE_CREATE_INFO,
+        imageType = .D2,
+        format = .D16_UNORM,
+        extent = {
+            width = surface_capabilities.currentExtent.width,
+            height = surface_capabilities.currentExtent.height,
+            depth = 1,
+        },
+        mipLevels = 1,
+        arrayLayers = 1,
+        samples = { ._1 },
+        tiling = .OPTIMAL,
+        usage = { .DEPTH_STENCIL_ATTACHMENT },
+        sharingMode = .EXCLUSIVE,
+        initialLayout = .UNDEFINED
+    }, nil, &depth_texture)
+    assert(result == .SUCCESS)
+
+    depth_texture_memory_requirements: vk.MemoryRequirements
+    vk.GetImageMemoryRequirements(device, depth_texture, &depth_texture_memory_requirements)
+
+    gpu_screen_allocation_residents := []MemoryResidentID {
+        {
+            handle = depth_texture,
+            is_image = true,
+        }
+    }
+
+    gpu_screen_allocation, gpu_screen_allocation_result := allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = depth_texture_memory_requirements.size * 4)
+    assert(gpu_screen_allocation_result == .SUCCESS)
+    defer {
+        vk.DestroyImage(device, depth_texture, nil)
+        destroy_allocation(device, &gpu_screen_allocation)
+    }
+
+    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+
+    depth_texture_view: vk.ImageView
+    result = vk.CreateImageView(device, &{
         sType = .IMAGE_VIEW_CREATE_INFO,
-        image = vk_depth_texture,
+        image = depth_texture,
         viewType = .D2,
         format = .D16_UNORM,
         components = {
@@ -807,83 +888,144 @@ main :: proc() {
             baseArrayLayer = 0,
             layerCount = 1,
         }
-    }, nil, &vk_depth_texture_view)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyImageView(vk_device, vk_depth_texture_view, nil)
+    }, nil, &depth_texture_view)
+    assert(result == .SUCCESS)
+    defer vk.DestroyImageView(device, depth_texture_view, nil)
 
-    vk_upload_buffer: vk.Buffer
-    vk_result = vk.CreateBuffer(vk_device, &{
+    upload_buffer: vk.Buffer
+    result = vk.CreateBuffer(device, &{
         sType = .BUFFER_CREATE_INFO,
         size = size_of(vertex_data) + size_of(index_data),
         usage = { .TRANSFER_SRC },
-    }, nil, &vk_upload_buffer)
+    }, nil, &upload_buffer)
+
+    uniform_buffer: vk.Buffer
+    result = vk.CreateBuffer(device, &{
+        sType = .BUFFER_CREATE_INFO,
+        size = size_of(UniformData),
+        usage = { .UNIFORM_BUFFER },
+    }, nil, &uniform_buffer)
+
+    cpu_allocation_residents := []MemoryResidentID {
+        {
+            handle = uniform_buffer,
+            is_image = false,
+        },
+        {
+            handle = upload_buffer,
+            is_image = false,
+        },
+    }
     
-    vk_upload_memory, vk_upload_memory_sizes, vk_upload_memory_offsets, vk_upload_allocation_result := allocate_for_resources(vk_device, vk_physical_device, {}, { vk_upload_buffer }, { .HOST_VISIBLE, .HOST_COHERENT })
-    assert(vk_upload_allocation_result == .SUCCESS)
+    cpu_allocation, cpu_allocation_result := allocate_for_resources(device, physical_device, cpu_allocation_residents, { .HOST_VISIBLE, .HOST_COHERENT })
+    assert(cpu_allocation_result == .SUCCESS)
     defer {
-        vk.DestroyBuffer(vk_device, vk_upload_buffer, nil)
-        vk.FreeMemory(vk_device, vk_upload_memory, nil)
+        vk.DestroyBuffer(device, upload_buffer, nil)
+        destroy_allocation(device, &cpu_allocation)
     }
 
-    vk_upload_buffer_size := vk_upload_memory_sizes[0]
-    vk_upload_buffer_offset := vk_upload_memory_offsets[0]
+    assert(bind_resources_to_allocation(device, cpu_allocation) == .SUCCESS)
 
-    assert(bind_resources_to_allocation(vk_device, vk_upload_memory, {}, { vk_upload_buffer }, vk_upload_memory_offsets) == .SUCCESS)
-    delete(vk_upload_memory_sizes)
-    delete(vk_upload_memory_offsets)
+    upload_buffer_mapped_rawptr: rawptr
+    assert(vk.MapMemory(device, cpu_allocation.memory, cpu_allocation.residents[{
+        handle = upload_buffer, is_image = false
+    }].offset, cpu_allocation.residents[{
+        handle = upload_buffer, is_image = false
+    }].size, {}, &upload_buffer_mapped_rawptr) == .SUCCESS)
 
-    vk_upload_buffer_mapped_rawptr: rawptr
-    assert(vk.MapMemory(vk_device, vk_upload_memory, vk_upload_buffer_offset, vk_upload_buffer_size, {}, &vk_upload_buffer_mapped_rawptr) == .SUCCESS)
+    upload_buffer_mapped := ([^]u8)(upload_buffer_mapped_rawptr)
+    intrinsics.mem_copy_non_overlapping(&upload_buffer_mapped[0], &vertex_data[0], size_of(vertex_data))
+    intrinsics.mem_copy_non_overlapping(&upload_buffer_mapped[size_of(vertex_data)], &index_data[0], size_of(index_data))
 
-    vk_upload_buffer_mapped := ([^]u8)(vk_upload_buffer_mapped_rawptr)
-    intrinsics.mem_copy_non_overlapping(&vk_upload_buffer_mapped[0], &vertex_data[0], size_of(vertex_data))
-    intrinsics.mem_copy_non_overlapping(&vk_upload_buffer_mapped[size_of(vertex_data)], &index_data[0], size_of(index_data))
+    vk.UnmapMemory(device, cpu_allocation.memory)
 
-    vk.UnmapMemory(vk_device, vk_upload_memory)
-
-    assert(vk.ResetCommandPool(vk_device, vk_command_pool, {}) == .SUCCESS)
-    assert(vk.BeginCommandBuffer(vk_command_buffer, &{
+    assert(vk.ResetCommandPool(device, command_pool, {}) == .SUCCESS)
+    assert(vk.BeginCommandBuffer(command_buffer, &{
         sType = .COMMAND_BUFFER_BEGIN_INFO,
     }) == .SUCCESS)
 
-    vk.CmdCopyBuffer(vk_command_buffer,
-        vk_upload_buffer, vk_vertex_index_buffer,
+    pre_copy_buffer_memory_barriers := [3]vk.BufferMemoryBarrier {
+        {
+            sType = .BUFFER_MEMORY_BARRIER,
+            srcAccessMask = {},
+            dstAccessMask = { .TRANSFER_READ },
+            buffer = upload_buffer,
+            offset = 0,
+            size = cpu_allocation.residents[{ handle = upload_buffer, is_image = false }].size,
+        },
+        {
+            sType = .BUFFER_MEMORY_BARRIER,
+            srcAccessMask = {},
+            dstAccessMask = { .TRANSFER_WRITE },
+            buffer = vertex_buffer,
+            offset = 0,
+            size = gpu_asset_allocation.residents[{ handle = vertex_buffer, is_image = false }].size,
+        },
+        {
+            sType = .BUFFER_MEMORY_BARRIER,
+            srcAccessMask = {},
+            dstAccessMask = { .TRANSFER_WRITE },
+            buffer = index_buffer,
+            offset = 0,
+            size = gpu_asset_allocation.residents[{ handle = index_buffer, is_image = false }].size,
+        },
+    }
+
+    vk.CmdPipelineBarrier(
+        command_buffer,
+        { .TOP_OF_PIPE }, { .TRANSFER }, {},
+        0, nil,
+        u32(len(pre_copy_buffer_memory_barriers)), &pre_copy_buffer_memory_barriers[0],
+        0, nil
+    )
+
+    vk.CmdCopyBuffer(command_buffer,
+        upload_buffer, vertex_buffer,
         1, &vk.BufferCopy {
             srcOffset = 0,
             dstOffset = 0,
-            size = vk_upload_buffer_size,
+            size = size_of(vertex_data),
         }
     )
 
-    assert(vk.EndCommandBuffer(vk_command_buffer) == .SUCCESS)
-    assert(vk.QueueSubmit(vk_queue, 1, &vk.SubmitInfo {
+    vk.CmdCopyBuffer(command_buffer,
+        upload_buffer, index_buffer,
+        1, &vk.BufferCopy {
+            srcOffset = size_of(vertex_data),
+            dstOffset = 0,
+            size = size_of(index_data),
+        }
+    )
+
+    assert(vk.EndCommandBuffer(command_buffer) == .SUCCESS)
+    assert(vk.QueueSubmit(queue, 1, &vk.SubmitInfo {
         sType = .SUBMIT_INFO,
         waitSemaphoreCount = 0,
         pWaitSemaphores = nil,
         pWaitDstStageMask = nil,
         commandBufferCount = 1,
-        pCommandBuffers = &vk_command_buffer,
+        pCommandBuffers = &command_buffer,
         signalSemaphoreCount = 0,
         pSignalSemaphores = nil,
     }, 0) == .SUCCESS)
 
-    assert(vk.QueueWaitIdle(vk_queue) == .SUCCESS)
+    assert(vk.QueueWaitIdle(queue) == .SUCCESS)
 
     shader_source_hlsl := cstring(#load("shaders.hlsl"))
-    vk_vertex_shader_module, vk_vertex_shader_compilation_result := compile_hlsl(vk_device, dxc_utils, dxc_compiler, shader_source_hlsl, "vertex_main", { .VERTEX })
-    if vk_vertex_shader_compilation_result != .SUCCESS {
-        fmt.panicf("Failed to compile vertex shader from shaders.hlsl: %s", vk_vertex_shader_compilation_result)
+    vertex_shader_module, vertex_shader_compilation_result := compile_hlsl(device, dxc_utils, dxc_compiler, shader_source_hlsl, "vertex_main", { .VERTEX })
+    if vertex_shader_compilation_result != .SUCCESS {
+        fmt.panicf("Failed to compile vertex shader from shaders.hlsl: %s", vertex_shader_compilation_result)
     }
-    defer vk.DestroyShaderModule(vk_device, vk_vertex_shader_module, nil)
+    defer vk.DestroyShaderModule(device, vertex_shader_module, nil)
 
-    vk_fragment_shader_module, vk_fragment_shader_compilation_result := compile_hlsl(vk_device, dxc_utils, dxc_compiler, shader_source_hlsl, "fragment_main", { .FRAGMENT })
-    if vk_fragment_shader_compilation_result != .SUCCESS {
-        fmt.panicf("Failed to compile fragment shader from shaders.hlsl: %s", vk_fragment_shader_compilation_result)
+    fragment_shader_module, fragment_shader_compilation_result := compile_hlsl(device, dxc_utils, dxc_compiler, shader_source_hlsl, "fragment_main", { .FRAGMENT })
+    if fragment_shader_compilation_result != .SUCCESS {
+        fmt.panicf("Failed to compile fragment shader from shaders.hlsl: %s", fragment_shader_compilation_result)
     }
-    defer vk.DestroyShaderModule(vk_device, vk_fragment_shader_module, nil)
+    defer vk.DestroyShaderModule(device, fragment_shader_module, nil)
 
-    vk_graphics_pipeline_descriptor_set_layout: vk.DescriptorSetLayout
-    vk_result = vk.CreateDescriptorSetLayout(vk_device, &{
+    graphics_pipeline_descriptor_set_layout: vk.DescriptorSetLayout
+    result = vk.CreateDescriptorSetLayout(device, &{
         sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         bindingCount = 1,
         pBindings = &vk.DescriptorSetLayoutBinding {
@@ -892,55 +1034,55 @@ main :: proc() {
             descriptorCount = 1,
             stageFlags = { .FRAGMENT },
         }
-    }, nil, &vk_graphics_pipeline_descriptor_set_layout)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyDescriptorSetLayout(vk_device, vk_graphics_pipeline_descriptor_set_layout, nil)
+    }, nil, &graphics_pipeline_descriptor_set_layout)
+    assert(result == .SUCCESS)
+    defer vk.DestroyDescriptorSetLayout(device, graphics_pipeline_descriptor_set_layout, nil)
 
-    vk_graphics_pipeline_layout: vk.PipelineLayout
-    vk_result = vk.CreatePipelineLayout(vk_device, &{
+    graphics_pipeline_layout: vk.PipelineLayout
+    result = vk.CreatePipelineLayout(device, &{
         sType = .PIPELINE_LAYOUT_CREATE_INFO,
         setLayoutCount = 1,
-        pSetLayouts = &vk_graphics_pipeline_descriptor_set_layout,
-    }, nil, &vk_graphics_pipeline_layout)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyPipelineLayout(vk_device, vk_graphics_pipeline_layout, nil)
+        pSetLayouts = &graphics_pipeline_descriptor_set_layout,
+    }, nil, &graphics_pipeline_layout)
+    assert(result == .SUCCESS)
+    defer vk.DestroyPipelineLayout(device, graphics_pipeline_layout, nil)
 
-    vk_graphics_pipeline_shader_stages := [2]vk.PipelineShaderStageCreateInfo {
+    graphics_pipeline_shader_stages := [2]vk.PipelineShaderStageCreateInfo {
         {
             sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
             stage = { .VERTEX },
-            module = vk_vertex_shader_module,
+            module = vertex_shader_module,
             pName = "vertex_main",
         },
         {
             sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
             stage = { .FRAGMENT },
-            module = vk_fragment_shader_module,
+            module = fragment_shader_module,
             pName = "fragment_main",
         },
     }
 
-    vk_graphics_pipeline_dynamic_states := [2]vk.DynamicState {
+    graphics_pipeline_dynamic_states := [2]vk.DynamicState {
         .VIEWPORT,
         .SCISSOR,
     }
 
-    vk_graphics_pipeline_color_attachment_formats := [1]vk.Format {
+    graphics_pipeline_color_attachment_formats := [1]vk.Format {
         .B8G8R8A8_UNORM,
     }
 
-    vk_graphics_pipeline: vk.Pipeline
-    vk_result = vk.CreateGraphicsPipelines(vk_device, 0, 1, &vk.GraphicsPipelineCreateInfo {
+    graphics_pipeline: vk.Pipeline
+    result = vk.CreateGraphicsPipelines(device, 0, 1, &vk.GraphicsPipelineCreateInfo {
         sType = .GRAPHICS_PIPELINE_CREATE_INFO,
         pNext = &vk.PipelineRenderingCreateInfoKHR {
             sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
-            colorAttachmentCount = u32(len(vk_graphics_pipeline_color_attachment_formats)),
-            pColorAttachmentFormats = &vk_graphics_pipeline_color_attachment_formats[0],
+            colorAttachmentCount = u32(len(graphics_pipeline_color_attachment_formats)),
+            pColorAttachmentFormats = &graphics_pipeline_color_attachment_formats[0],
             depthAttachmentFormat = .D16_UNORM,
             stencilAttachmentFormat = .UNDEFINED,
         },
         stageCount = 2,
-        pStages = &vk_graphics_pipeline_shader_stages[0],
+        pStages = &graphics_pipeline_shader_stages[0],
         pVertexInputState = &{
             sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
             vertexBindingDescriptionCount = 1,
@@ -963,7 +1105,22 @@ main :: proc() {
         pViewportState = &{
             sType = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
             viewportCount = 1,
+            pViewports = &vk.Viewport {
+                x = 0,
+                y = f32(surface_capabilities.currentExtent.height),
+                width = f32(surface_capabilities.currentExtent.width),
+                height = -f32(surface_capabilities.currentExtent.height),
+                minDepth = 0.0,
+                maxDepth = 1.0,
+            },
             scissorCount = 1,
+            pScissors = &vk.Rect2D {
+                offset = {
+                    x = 0,
+                    y = 0,
+                },
+                extent = surface_capabilities.currentExtent,
+            },
         },
         pRasterizationState = &{
             sType = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -978,9 +1135,9 @@ main :: proc() {
         },
         pDepthStencilState = &{
             sType = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-            depthTestEnable = false,
-            depthWriteEnable = false,
-            depthCompareOp = .LESS_OR_EQUAL,
+            depthTestEnable = true,
+            depthWriteEnable = true,
+            depthCompareOp = .LESS,
             minDepthBounds = 0.0,
             maxDepthBounds = 1.0,
         },
@@ -988,23 +1145,30 @@ main :: proc() {
             sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
             attachmentCount = 1,
             pAttachments = &vk.PipelineColorBlendAttachmentState {
-                blendEnable = false,
+                blendEnable = true,
+                srcColorBlendFactor = .ONE,
+                dstColorBlendFactor = .ZERO,
+                colorBlendOp = .ADD,
+                srcAlphaBlendFactor = .ONE,
+                dstAlphaBlendFactor = .ZERO,
+                alphaBlendOp = .ADD,
+                colorWriteMask = { .R, .G, .B, .A },
             },
             blendConstants = { 1.0, 1.0, 1.0, 1.0 },
         },
         pDynamicState = &{
             sType = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-            dynamicStateCount = u32(len(vk_graphics_pipeline_dynamic_states)),
-            pDynamicStates = &vk_graphics_pipeline_dynamic_states[0],
+            dynamicStateCount = u32(len(graphics_pipeline_dynamic_states)),
+            pDynamicStates = &graphics_pipeline_dynamic_states[0],
         },
-        layout = vk_graphics_pipeline_layout,
+        layout = graphics_pipeline_layout,
         renderPass = 0,
-    }, nil, &vk_graphics_pipeline)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyPipeline(vk_device, vk_graphics_pipeline, nil)
+    }, nil, &graphics_pipeline)
+    assert(result == .SUCCESS)
+    defer vk.DestroyPipeline(device, graphics_pipeline, nil)
 
-    vk_graphics_pipeline_descriptor_pool: vk.DescriptorPool
-    vk_result = vk.CreateDescriptorPool(vk_device, &{
+    graphics_pipeline_descriptor_pool: vk.DescriptorPool
+    result = vk.CreateDescriptorPool(device, &{
         sType = .DESCRIPTOR_POOL_CREATE_INFO,
         maxSets = 1,
         poolSizeCount = 1,
@@ -1012,64 +1176,172 @@ main :: proc() {
             type = .STORAGE_IMAGE,
             descriptorCount = 1,
         },
-    }, nil, &vk_graphics_pipeline_descriptor_pool)
-    assert(vk_result == .SUCCESS)
-    defer vk.DestroyDescriptorPool(vk_device, vk_graphics_pipeline_descriptor_pool, nil)
+    }, nil, &graphics_pipeline_descriptor_pool)
+    assert(result == .SUCCESS)
+    defer vk.DestroyDescriptorPool(device, graphics_pipeline_descriptor_pool, nil)
 
-    vk_graphics_pipeline_descriptor_set: vk.DescriptorSet
-    vk_result = vk.AllocateDescriptorSets(vk_device, &{
+    graphics_pipeline_descriptor_set: vk.DescriptorSet
+    result = vk.AllocateDescriptorSets(device, &{
         sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
-        descriptorPool = vk_graphics_pipeline_descriptor_pool,
+        descriptorPool = graphics_pipeline_descriptor_pool,
         descriptorSetCount = 1,
-        pSetLayouts = &vk_graphics_pipeline_descriptor_set_layout,
-    }, &vk_graphics_pipeline_descriptor_set)
-    assert(vk_result == .SUCCESS)
+        pSetLayouts = &graphics_pipeline_descriptor_set_layout,
+    }, &graphics_pipeline_descriptor_set)
+    assert(result == .SUCCESS)
     
-    vk.UpdateDescriptorSets(vk_device, 1, &vk.WriteDescriptorSet {
+    vk.UpdateDescriptorSets(device, 1, &vk.WriteDescriptorSet {
         sType = .WRITE_DESCRIPTOR_SET,
-        dstSet = vk_graphics_pipeline_descriptor_set,
+        dstSet = graphics_pipeline_descriptor_set,
         dstBinding = 0,
         dstArrayElement = 0,
         descriptorCount = 1,
         descriptorType = .STORAGE_IMAGE,
         pImageInfo = &{
-            imageView = vk_voxel_texture_view,
+            imageView = voxel_texture_view,
             imageLayout = .GENERAL,
         },
     }, 0, nil)
 
-    vk_swapchain_enabled := true
+    swapchain_enabled := true
     main_loop: for true {
         event: sdl3.Event
         for sdl3.PollEvent(&event) {
             if event.type == .QUIT {
                 break main_loop
             } else if event.type == .WINDOW_RESIZED {
-                vk_surface_capabilities, vk_swapchain_enabled = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
+                assert(vk.DeviceWaitIdle(device) == .SUCCESS)
+                surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
+                
+                vk.DestroyImageView(device, depth_texture_view, nil)
+                vk.DestroyImage(device, depth_texture, nil)
+
+                result = vk.CreateImage(device, &{
+                    sType = .IMAGE_CREATE_INFO,
+                    imageType = .D2,
+                    format = .D16_UNORM,
+                    extent = {
+                        width = surface_capabilities.currentExtent.width,
+                        height = surface_capabilities.currentExtent.height,
+                        depth = 1,
+                    },
+                    mipLevels = 1,
+                    arrayLayers = 1,
+                    samples = { ._1 },
+                    tiling = .OPTIMAL,
+                    usage = { .DEPTH_STENCIL_ATTACHMENT },
+                    sharingMode = .EXCLUSIVE,
+                    initialLayout = .UNDEFINED,
+                }, nil, &depth_texture)
+                assert(result == .SUCCESS)
+
+                vk.GetImageMemoryRequirements(device, depth_texture, &depth_texture_memory_requirements)
+                if depth_texture_memory_requirements.size > gpu_screen_allocation.size {
+                    destroy_allocation(device, &gpu_screen_allocation)
+
+                    gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
+                    assert(gpu_screen_allocation_result == .SUCCESS)
+                    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                }
+                
+                depth_texture_view: vk.ImageView
+                result = vk.CreateImageView(device, &{
+                    sType = .IMAGE_VIEW_CREATE_INFO,
+                    image = depth_texture,
+                    viewType = .D2,
+                    format = .D16_UNORM,
+                    components = {
+                        r = .IDENTITY,
+                        g = .IDENTITY,
+                        b = .IDENTITY,
+                        a = .IDENTITY,
+                    },
+                    subresourceRange = {
+                        aspectMask = { .DEPTH },
+                        baseMipLevel = 0,
+                        levelCount = 1,
+                        baseArrayLayer = 0,
+                        layerCount = 1,
+                    }
+                }, nil, &depth_texture_view)
+                assert(result == .SUCCESS)
             }
         }
 
-        if vk_swapchain_enabled {
-            vk.WaitForFences(vk_device, 1, &vk_in_flight_fence, true, max(u64))
+        if swapchain_enabled {
+            vk.WaitForFences(device, 1, &in_flight_fence, true, max(u64))
 
-            vk_image_index: u32
-            vk_result = vk.AcquireNextImageKHR(vk_device, vk_swapchain, max(u64), vk_image_acquisition_semaphore, 0, &vk_image_index)
-            if vk_result == .ERROR_OUT_OF_DATE_KHR {
-                vk_surface_capabilities, vk_swapchain_enabled = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
+            image_index: u32
+            result = vk.AcquireNextImageKHR(device, swapchain, max(u64), image_acquisition_semaphore, 0, &image_index)
+            if result == .ERROR_OUT_OF_DATE_KHR {
+                assert(vk.DeviceWaitIdle(device) == .SUCCESS)
+                surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
+                
+                vk.DestroyImageView(device, depth_texture_view, nil)
+                vk.DestroyImage(device, depth_texture, nil)
+
+                result = vk.CreateImage(device, &{
+                    sType = .IMAGE_CREATE_INFO,
+                    imageType = .D2,
+                    format = .D16_UNORM,
+                    extent = {
+                        width = surface_capabilities.currentExtent.width,
+                        height = surface_capabilities.currentExtent.height,
+                        depth = 1,
+                    },
+                    mipLevels = 1,
+                    arrayLayers = 1,
+                    samples = { ._1 },
+                    tiling = .OPTIMAL,
+                    usage = { .DEPTH_STENCIL_ATTACHMENT },
+                    sharingMode = .EXCLUSIVE,
+                    initialLayout = .UNDEFINED,
+                }, nil, &depth_texture)
+                assert(result == .SUCCESS)
+
+                vk.GetImageMemoryRequirements(device, depth_texture, &depth_texture_memory_requirements)
+                if depth_texture_memory_requirements.size > gpu_screen_allocation.size {
+                    destroy_allocation(device, &gpu_screen_allocation)
+
+                    gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
+                    assert(gpu_screen_allocation_result == .SUCCESS)
+                    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                }
+                
+                depth_texture_view: vk.ImageView
+                result = vk.CreateImageView(device, &{
+                    sType = .IMAGE_VIEW_CREATE_INFO,
+                    image = depth_texture,
+                    viewType = .D2,
+                    format = .D16_UNORM,
+                    components = {
+                        r = .IDENTITY,
+                        g = .IDENTITY,
+                        b = .IDENTITY,
+                        a = .IDENTITY,
+                    },
+                    subresourceRange = {
+                        aspectMask = { .DEPTH },
+                        baseMipLevel = 0,
+                        levelCount = 1,
+                        baseArrayLayer = 0,
+                        layerCount = 1,
+                    }
+                }, nil, &depth_texture_view)
+                assert(result == .SUCCESS)
                 continue
-            } else if vk_result != .SUCCESS && vk_result != .SUBOPTIMAL_KHR {
-                fmt.panicf("Failed to acquire swapchain image: %s", vk_result)
+            } else if result != .SUCCESS && result != .SUBOPTIMAL_KHR {
+                fmt.panicf("Failed to acquire swapchain image: %s", result)
             }
 
-            vk.ResetFences(vk_device, 1, &vk_in_flight_fence)
+            vk.ResetFences(device, 1, &in_flight_fence)
 
-            assert(vk.ResetCommandPool(vk_device, vk_command_pool, {}) == .SUCCESS)
-            assert(vk.BeginCommandBuffer(vk_command_buffer, &{
+            assert(vk.ResetCommandPool(device, command_pool, {}) == .SUCCESS)
+            assert(vk.BeginCommandBuffer(command_buffer, &{
                 sType = .COMMAND_BUFFER_BEGIN_INFO,
                 flags = { .ONE_TIME_SUBMIT },
             }) == .SUCCESS)
 
-            vk.CmdPipelineBarrier(vk_command_buffer,
+            vk.CmdPipelineBarrier(command_buffer,
                 { .TRANSFER }, { .COLOR_ATTACHMENT_OUTPUT }, {},
                 0, nil,
                 0, nil,
@@ -1079,7 +1351,7 @@ main :: proc() {
                     dstAccessMask = { .COLOR_ATTACHMENT_WRITE },
                     oldLayout = .UNDEFINED,
                     newLayout = .COLOR_ATTACHMENT_OPTIMAL,
-                    image = vk_swapchain_images[vk_image_index],
+                    image = swapchain_images[image_index],
                     subresourceRange = {
                         aspectMask = { .COLOR },
                         baseMipLevel = 0,
@@ -1090,7 +1362,7 @@ main :: proc() {
                 }
             )
 
-            vk.CmdPipelineBarrier(vk_command_buffer,
+            vk.CmdPipelineBarrier(command_buffer,
                 { .BOTTOM_OF_PIPE }, { .EARLY_FRAGMENT_TESTS }, {},
                 0, nil,
                 0, nil,
@@ -1100,7 +1372,7 @@ main :: proc() {
                     dstAccessMask = { .DEPTH_STENCIL_ATTACHMENT_READ, .DEPTH_STENCIL_ATTACHMENT_WRITE },
                     oldLayout = .UNDEFINED,
                     newLayout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    image = vk_depth_texture,
+                    image = depth_texture,
                     subresourceRange = {
                         aspectMask = { .DEPTH },
                         baseMipLevel = 0,
@@ -1111,7 +1383,7 @@ main :: proc() {
                 }
             )
 
-            vk.CmdPipelineBarrier(vk_command_buffer,
+            vk.CmdPipelineBarrier(command_buffer,
                 { .BOTTOM_OF_PIPE }, { .FRAGMENT_SHADER }, {},
                 0, nil,
                 0, nil,
@@ -1121,7 +1393,7 @@ main :: proc() {
                     dstAccessMask = { .SHADER_READ },
                     oldLayout = .UNDEFINED,
                     newLayout = .GENERAL,
-                    image = vk_voxel_texture,
+                    image = voxel_texture,
                     subresourceRange = {
                         aspectMask = { .COLOR },
                         baseMipLevel = 0,
@@ -1132,7 +1404,7 @@ main :: proc() {
                 }
             )
 
-            vk.CmdBeginRenderingKHR(vk_command_buffer, &{
+            vk.CmdBeginRenderingKHR(command_buffer, &{
                 sType = .RENDERING_INFO_KHR,
                 renderArea = {
                     offset = {
@@ -1140,28 +1412,27 @@ main :: proc() {
                         y = 0,
                     },
                     extent = {
-                        width = vk_surface_capabilities.currentExtent.width,
-                        height = vk_surface_capabilities.currentExtent.height,
+                        width = surface_capabilities.currentExtent.width,
+                        height = surface_capabilities.currentExtent.height,
                     },
                 },
                 layerCount = 1,
-                viewMask = 0,
                 colorAttachmentCount = 1,
                 pColorAttachments = &vk.RenderingAttachmentInfoKHR {
                     sType = .RENDERING_ATTACHMENT_INFO_KHR,
-                    imageView = vk_swapchain_image_views[vk_image_index],
+                    imageView = swapchain_image_views[image_index],
                     imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
                     loadOp = .CLEAR,
                     storeOp = .STORE,
                     clearValue = {
                         color = {
-                            float32 = { 0.0, 0.3, 0.0, 1.0 },
+                            float32 = { 0.3, 0.0, 0.0, 1.0 },
                         }
                     }
                 },
                 pDepthAttachment = &vk.RenderingAttachmentInfoKHR {
                     sType = .RENDERING_ATTACHMENT_INFO_KHR,
-                    imageView = vk_depth_texture_view,
+                    imageView = depth_texture_view,
                     imageLayout = .DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                     loadOp = .CLEAR,
                     storeOp = .DONT_CARE,
@@ -1173,34 +1444,34 @@ main :: proc() {
                 },
             })
 
-            vk.CmdBindPipeline(vk_command_buffer, .GRAPHICS, vk_graphics_pipeline)
-            vk.CmdBindDescriptorSets(vk_command_buffer, .GRAPHICS, vk_graphics_pipeline_layout, 0, 1, &vk_graphics_pipeline_descriptor_set, 0, nil)
-
-            vk.CmdSetViewport(vk_command_buffer, 0, 1, &vk.Viewport {
+            vk.CmdSetViewport(command_buffer, 0, 1, &vk.Viewport {
                 x = 0,
-                y = 0,
-                width = f32(vk_surface_capabilities.currentExtent.width),
-                height = f32(vk_surface_capabilities.currentExtent.height),
+                y = f32(surface_capabilities.currentExtent.height),
+                width = f32(surface_capabilities.currentExtent.width),
+                height = -f32(surface_capabilities.currentExtent.height),
                 minDepth = 0.0,
                 maxDepth = 1.0,
             })
 
-            vk.CmdSetScissor(vk_command_buffer, 0, 1, &vk.Rect2D {
+            vk.CmdSetScissor(command_buffer, 0, 1, &vk.Rect2D {
                 offset = {
                     x = 0,
                     y = 0,
                 },
-                extent = vk_surface_capabilities.currentExtent,
+                extent = surface_capabilities.currentExtent,
             })
 
-            vk_vertex_offset := vk.DeviceSize(0)
-            vk.CmdBindVertexBuffers(vk_command_buffer, 0, 1, &vk_vertex_index_buffer, &vk_vertex_offset)
-            vk.CmdBindIndexBuffer(vk_command_buffer, vk_vertex_index_buffer, vk.DeviceSize(len(index_data)), .UINT32)
-            vk.CmdDrawIndexed(vk_command_buffer, u32(len(index_data)), 1, 0, 0, 0)
+            vk.CmdBindPipeline(command_buffer, .GRAPHICS, graphics_pipeline)
+            vk.CmdBindDescriptorSets(command_buffer, .GRAPHICS, graphics_pipeline_layout, 0, 1, &graphics_pipeline_descriptor_set, 0, nil)
 
-            vk.CmdEndRenderingKHR(vk_command_buffer)
+            vertex_offset := vk.DeviceSize(0)
+            vk.CmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffer, &vertex_offset)
+            vk.CmdBindIndexBuffer(command_buffer, index_buffer, 0, .UINT32)
+            vk.CmdDrawIndexed(command_buffer, u32(len(index_data)), 1, 0, 0, 0)
 
-            vk.CmdPipelineBarrier(vk_command_buffer,
+            vk.CmdEndRenderingKHR(command_buffer)
+
+            vk.CmdPipelineBarrier(command_buffer,
                 { .COLOR_ATTACHMENT_OUTPUT }, { .TRANSFER }, {},
                 0, nil, 0, nil, 1, & vk.ImageMemoryBarrier {
                 sType = .IMAGE_MEMORY_BARRIER,
@@ -1208,7 +1479,7 @@ main :: proc() {
                 dstAccessMask = {},
                 oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
                 newLayout = .PRESENT_SRC_KHR,
-                image = vk_swapchain_images[vk_image_index],
+                image = swapchain_images[image_index],
                 subresourceRange = {
                     aspectMask = { .COLOR },
                     baseMipLevel = 0,
@@ -1217,38 +1488,92 @@ main :: proc() {
                     layerCount = 1,
                 },
             })
-            assert(vk.EndCommandBuffer(vk_command_buffer) == .SUCCESS)
+            assert(vk.EndCommandBuffer(command_buffer) == .SUCCESS)
 
             wait_stage := vk.PipelineStageFlags { .COLOR_ATTACHMENT_OUTPUT }
-            assert(vk.QueueSubmit(vk_queue, 1, &vk.SubmitInfo {
+            assert(vk.QueueSubmit(queue, 1, &vk.SubmitInfo {
                 sType = .SUBMIT_INFO,
                 waitSemaphoreCount = 1,
-                pWaitSemaphores = &vk_image_acquisition_semaphore,
+                pWaitSemaphores = &image_acquisition_semaphore,
                 commandBufferCount = 1,
-                pCommandBuffers = &vk_command_buffer,
+                pCommandBuffers = &command_buffer,
                 signalSemaphoreCount = 1,
-                pSignalSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
+                pSignalSemaphores = &swapchain_image_finished_semaphores[image_index],
                 pWaitDstStageMask = &wait_stage,
-            }, vk_in_flight_fence) == .SUCCESS)
+            }, in_flight_fence) == .SUCCESS)
 
-            vk_present_results: vk.Result
-            vk_result = vk.QueuePresentKHR(vk_queue, &{
+            present_results: vk.Result
+            result = vk.QueuePresentKHR(queue, &{
                 sType = .PRESENT_INFO_KHR,
                 waitSemaphoreCount = 1,
-                pWaitSemaphores = &vk_swapchain_image_finished_semaphores[vk_image_index],
+                pWaitSemaphores = &swapchain_image_finished_semaphores[image_index],
                 swapchainCount = 1,
-                pSwapchains = &vk_swapchain,
-                pImageIndices = &vk_image_index,
-                pResults = &vk_present_results,
+                pSwapchains = &swapchain,
+                pImageIndices = &image_index,
+                pResults = &present_results,
             })
 
-            if vk_result == .ERROR_OUT_OF_DATE_KHR || vk_result == .SUBOPTIMAL_KHR {
-                vk_surface_capabilities, vk_swapchain_enabled = resize_swapchain(vk_device, vk_physical_device, vk_surface, &vk_swapchain, &vk_swapchain_image_count, &vk_swapchain_images, &vk_swapchain_image_views, &vk_swapchain_image_finished_semaphores)
-            } else if vk_result != .SUCCESS {
-                fmt.panicf("Failed to present: %s", vk_result)
+            if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR {
+                assert(vk.DeviceWaitIdle(device) == .SUCCESS)
+                surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
+                
+                vk.DestroyImageView(device, depth_texture_view, nil)
+                vk.DestroyImage(device, depth_texture, nil)
+
+                result = vk.CreateImage(device, &{
+                    sType = .IMAGE_CREATE_INFO,
+                    imageType = .D2,
+                    format = .D16_UNORM,
+                    extent = {
+                        width = surface_capabilities.currentExtent.width,
+                        height = surface_capabilities.currentExtent.height,
+                        depth = 1,
+                    },
+                    mipLevels = 1,
+                    arrayLayers = 1,
+                    samples = { ._1 },
+                    tiling = .OPTIMAL,
+                    usage = { .DEPTH_STENCIL_ATTACHMENT },
+                    sharingMode = .EXCLUSIVE,
+                    initialLayout = .UNDEFINED,
+                }, nil, &depth_texture)
+                assert(result == .SUCCESS)
+
+                vk.GetImageMemoryRequirements(device, depth_texture, &depth_texture_memory_requirements)
+                if depth_texture_memory_requirements.size > gpu_screen_allocation.size {
+                    destroy_allocation(device, &gpu_screen_allocation)
+
+                    gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
+                    assert(gpu_screen_allocation_result == .SUCCESS)
+                    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                }
+                
+                depth_texture_view: vk.ImageView
+                result = vk.CreateImageView(device, &{
+                    sType = .IMAGE_VIEW_CREATE_INFO,
+                    image = depth_texture,
+                    viewType = .D2,
+                    format = .D16_UNORM,
+                    components = {
+                        r = .IDENTITY,
+                        g = .IDENTITY,
+                        b = .IDENTITY,
+                        a = .IDENTITY,
+                    },
+                    subresourceRange = {
+                        aspectMask = { .DEPTH },
+                        baseMipLevel = 0,
+                        levelCount = 1,
+                        baseArrayLayer = 0,
+                        layerCount = 1,
+                    }
+                }, nil, &depth_texture_view)
+                assert(result == .SUCCESS)
+            } else if result != .SUCCESS {
+                fmt.panicf("Failed to present: %s", result)
             }
         }
     }
 
-    assert(vk.DeviceWaitIdle(vk_device) == .SUCCESS)
+    assert(vk.DeviceWaitIdle(device) == .SUCCESS)
 }
