@@ -280,6 +280,38 @@ bind_resources_to_allocation :: proc {
     /* bind_resources_to_allocation_manual, */ 
 }
 
+replace_resource_in_allocation :: proc(
+    device: vk.Device,
+    allocation: ^MemoryAllocation,
+    old_resident: MemoryResidentID,
+    new_resident: MemoryResidentID
+) {
+    if old_resident == new_resident {
+        return
+    }
+
+    memory_requirements: vk.MemoryRequirements
+    if new_resident.is_image {
+        vk.GetImageMemoryRequirements(device, new_resident.handle.(vk.Image), &memory_requirements)
+    } else {
+        vk.GetBufferMemoryRequirements(device, new_resident.handle.(vk.Buffer), &memory_requirements)
+    }
+
+    allocation.residents[new_resident] = {
+        id = new_resident,
+        size = memory_requirements.size,
+        alignment = memory_requirements.alignment,
+        offset = allocation.residents[old_resident].offset,
+    }
+
+    delete_key(&allocation.residents, old_resident)
+    if new_resident.is_image {
+        vk.BindImageMemory(device, new_resident.handle.(vk.Image), allocation.memory, allocation.residents[new_resident].offset)
+    } else {
+        vk.BindBufferMemory(device, new_resident.handle.(vk.Buffer), allocation.memory, allocation.residents[new_resident].offset)
+    }
+}
+
 when ODIN_OS == .Windows {
     @(private) _convert_cstring_to_wstring :: proc(s: string) -> []c.wchar_t {
         wstring := make([]c.wchar_t, len(s) + 1)
@@ -468,7 +500,7 @@ main :: proc() {
         append(&instance_extensions, sdl_extensions[i])
     }
 
-    append(&instance_extensions, "EXT_debug_utils")
+    append(&instance_extensions, "VK_EXT_debug_utils")
 
     instance_flags := vk.InstanceCreateFlags {}
     when ODIN_OS == .Darwin {
@@ -477,7 +509,7 @@ main :: proc() {
 
     instance_layers := make([dynamic]cstring, 0, 1)
     when ODIN_DEBUG {
-        append(&instance_layers, "LAYER_KHRONOS_validation")
+        append(&instance_layers, "VK_LAYER_KHRONOS_validation")
     }
 
     instance: vk.Instance
@@ -542,8 +574,8 @@ main :: proc() {
     assert(vk.EnumerateDeviceExtensionProperties(physical_device, nil, &available_device_extension_count, &available_device_extensions[0]) == .SUCCESS)
     
     device_extensions := make([dynamic]cstring, 2, 8)
-    device_extensions[0] = "KHR_swapchain"
-    device_extensions[1] = "KHR_dynamic_rendering"
+    device_extensions[0] = "VK_KHR_swapchain"
+    device_extensions[1] = "VK_KHR_dynamic_rendering"
 
     pnext := rawptr(nil)
 
@@ -567,32 +599,32 @@ main :: proc() {
     }
 
     for &p in available_device_extensions {
-        if cstring(&p.extensionName[0]) == "EXT_pageable_device_local_memory" {
+        if cstring(&p.extensionName[0]) == "VK_EXT_pageable_device_local_memory" {
             found_ext_pageable_device_local_memory = true
-        } else if cstring(&p.extensionName[0]) == "EXT_memory_priority" {
+        } else if cstring(&p.extensionName[0]) == "VK_EXT_memory_priority" {
             found_ext_memory_priority = true
-        } else if cstring(&p.extensionName[0]) == "KHR_dynamic_rendering" {
+        } else if cstring(&p.extensionName[0]) == "VK_KHR_dynamic_rendering" {
             found_khr_dynamic_rendering = true
         }
     }
 
     if found_ext_memory_priority && found_ext_pageable_device_local_memory {
-        append(&device_extensions, "EXT_memory_priority")
+        append(&device_extensions, "VK_EXT_memory_priority")
         memory_priority_features.pNext = pnext
 
-        append(&device_extensions, "EXT_pageable_device_local_memory")
+        append(&device_extensions, "VK_EXT_pageable_device_local_memory")
         pageable_device_local_memory_features.pNext = &memory_priority_features
         pnext = &pageable_device_local_memory_features
     }
 
     if found_khr_dynamic_rendering {
-        append(&device_extensions, "KHR_dynamic_rendering")
+        append(&device_extensions, "VK_KHR_dynamic_rendering")
         dynamic_rendering_features.pNext = pnext
         pnext = &dynamic_rendering_features
     }
 
     when ODIN_OS == .Darwin {
-        append(&device_extensions, "KHR_portability_subset")
+        append(&device_extensions, "VK_KHR_portability_subset")
     }
 
     queue_priority := f32(1.0)
@@ -860,7 +892,7 @@ main :: proc() {
         }
     }
 
-    gpu_screen_allocation, gpu_screen_allocation_result := allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = depth_texture_memory_requirements.size * 4)
+    gpu_screen_allocation, gpu_screen_allocation_result := allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = depth_texture_memory_requirements.size * 2)
     assert(gpu_screen_allocation_result == .SUCCESS)
     defer {
         vk.DestroyImage(device, depth_texture, nil)
@@ -920,6 +952,7 @@ main :: proc() {
     cpu_allocation, cpu_allocation_result := allocate_for_resources(device, physical_device, cpu_allocation_residents, { .HOST_VISIBLE, .HOST_COHERENT })
     assert(cpu_allocation_result == .SUCCESS)
     defer {
+        vk.DestroyBuffer(device, uniform_buffer, nil)
         vk.DestroyBuffer(device, upload_buffer, nil)
         destroy_allocation(device, &cpu_allocation)
     }
@@ -1238,12 +1271,23 @@ main :: proc() {
                 if depth_texture_memory_requirements.size > gpu_screen_allocation.size {
                     destroy_allocation(device, &gpu_screen_allocation)
 
+                    gpu_screen_allocation_residents = {
+                        {
+                            handle = depth_texture,
+                            is_image = true,
+                        }
+                    }
+
                     gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
                     assert(gpu_screen_allocation_result == .SUCCESS)
                     assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                } else {
+                    replace_resource_in_allocation(device, &gpu_screen_allocation, gpu_screen_allocation_residents[0], {
+                        handle = depth_texture,
+                        is_image = true,
+                    })
                 }
                 
-                depth_texture_view: vk.ImageView
                 result = vk.CreateImageView(device, &{
                     sType = .IMAGE_VIEW_CREATE_INFO,
                     image = depth_texture,
@@ -1272,8 +1316,7 @@ main :: proc() {
 
             image_index: u32
             result = vk.AcquireNextImageKHR(device, swapchain, max(u64), image_acquisition_semaphore, 0, &image_index)
-            if result == .ERROR_OUT_OF_DATE_KHR {
-                assert(vk.DeviceWaitIdle(device) == .SUCCESS)
+            if result == .ERROR_OUT_OF_DATE_KHR {assert(vk.DeviceWaitIdle(device) == .SUCCESS)
                 surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
                 
                 vk.DestroyImageView(device, depth_texture_view, nil)
@@ -1302,12 +1345,23 @@ main :: proc() {
                 if depth_texture_memory_requirements.size > gpu_screen_allocation.size {
                     destroy_allocation(device, &gpu_screen_allocation)
 
+                    gpu_screen_allocation_residents = {
+                        {
+                            handle = depth_texture,
+                            is_image = true,
+                        }
+                    }
+                    
                     gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
                     assert(gpu_screen_allocation_result == .SUCCESS)
                     assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                } else {
+                    replace_resource_in_allocation(device, &gpu_screen_allocation, gpu_screen_allocation_residents[0], {
+                        handle = depth_texture,
+                        is_image = true,
+                    })
                 }
                 
-                depth_texture_view: vk.ImageView
                 result = vk.CreateImageView(device, &{
                     sType = .IMAGE_VIEW_CREATE_INFO,
                     image = depth_texture,
@@ -1513,10 +1567,9 @@ main :: proc() {
                 pResults = &present_results,
             })
 
-            if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR {
-                assert(vk.DeviceWaitIdle(device) == .SUCCESS)
+            if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR {assert(vk.DeviceWaitIdle(device) == .SUCCESS)
                 surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
-                
+
                 vk.DestroyImageView(device, depth_texture_view, nil)
                 vk.DestroyImage(device, depth_texture, nil)
 
@@ -1543,12 +1596,23 @@ main :: proc() {
                 if depth_texture_memory_requirements.size > gpu_screen_allocation.size {
                     destroy_allocation(device, &gpu_screen_allocation)
 
+                    gpu_screen_allocation_residents = {
+                        {
+                            handle = depth_texture,
+                            is_image = true,
+                        }
+                    }
+                    
                     gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
                     assert(gpu_screen_allocation_result == .SUCCESS)
                     assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                } else {
+                    replace_resource_in_allocation(device, &gpu_screen_allocation, gpu_screen_allocation_residents[0], {
+                        handle = depth_texture,
+                        is_image = true,
+                    })
                 }
                 
-                depth_texture_view: vk.ImageView
                 result = vk.CreateImageView(device, &{
                     sType = .IMAGE_VIEW_CREATE_INFO,
                     image = depth_texture,
