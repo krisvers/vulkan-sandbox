@@ -9,6 +9,8 @@ import "vendor:directx/dxc"
 import "core:c"
 import "core:strings"
 import "core:unicode/utf16"
+import "core:math/linalg"
+import "core:math"
 
 when ODIN_OS == .Darwin {
     @(export)
@@ -17,6 +19,9 @@ when ODIN_OS == .Darwin {
 
 UniformData :: struct {
     mvp_matrix: matrix[4, 4]f32,
+    box_size: [3]u32,
+    debug_value: u32,
+    screen_size: [2]f32,
 }
 
 MemoryResidentHandle :: union {
@@ -767,11 +772,33 @@ main :: proc() {
         arrayLayers = 1,
         samples = { ._1 },
         tiling = .OPTIMAL,
-        usage = { .STORAGE },
+        usage = { .STORAGE, .TRANSFER_DST },
         sharingMode = .EXCLUSIVE,
         initialLayout = .UNDEFINED,
     }, nil, &voxel_texture)
     assert(result == .SUCCESS)
+
+    voxel_data := [64]u8 {
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0x00, 0x00, 0xff,
+        0xff, 0x00, 0x00, 0xff,
+        0xff, 0xff, 0xff, 0xff,
+
+        0xaf, 0x00, 0x00, 0xaf,
+        0x00, 0x7f, 0x7f, 0x00,
+        0x00, 0x7f, 0x7f, 0x00,
+        0xaf, 0x00, 0x00, 0xaf,
+
+        0xaf, 0x00, 0x00, 0xaf,
+        0x00, 0x7f, 0x7f, 0x00,
+        0x00, 0x7f, 0x7f, 0x00,
+        0xaf, 0x00, 0x00, 0xaf,
+
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0x00, 0x00, 0xff,
+        0xff, 0x00, 0x00, 0xff,
+        0xff, 0xff, 0xff, 0xff,
+    }
 
     vertex_data := [24]f32 {
         0, 0, 0,
@@ -862,6 +889,24 @@ main :: proc() {
     assert(result == .SUCCESS)
     defer vk.DestroyImageView(device, voxel_texture_view, nil)
 
+    voxel_texture_sampler: vk.Sampler
+    result = vk.CreateSampler(device, &{
+        sType = .SAMPLER_CREATE_INFO,
+        magFilter = .NEAREST,
+        minFilter = .NEAREST,
+        mipmapMode = .NEAREST,
+        addressModeU = .CLAMP_TO_EDGE,
+        addressModeV = .CLAMP_TO_EDGE,
+        addressModeW = .CLAMP_TO_EDGE,
+        mipLodBias = 0.0,
+        maxAnisotropy = 1.0,
+        compareOp = .ALWAYS,
+        minLod = 0.0,
+        maxLod = 3.0,
+    }, nil, &voxel_texture_sampler)
+    assert(result == .SUCCESS)
+    defer vk.DestroySampler(device, voxel_texture_sampler, nil)
+
     depth_texture: vk.Image
     result = vk.CreateImage(device, &{
         sType = .IMAGE_CREATE_INFO,
@@ -927,7 +972,7 @@ main :: proc() {
     upload_buffer: vk.Buffer
     result = vk.CreateBuffer(device, &{
         sType = .BUFFER_CREATE_INFO,
-        size = size_of(vertex_data) + size_of(index_data),
+        size = size_of(vertex_data) + size_of(index_data) + size_of(voxel_data),
         usage = { .TRANSFER_SRC },
     }, nil, &upload_buffer)
 
@@ -959,18 +1004,20 @@ main :: proc() {
 
     assert(bind_resources_to_allocation(device, cpu_allocation) == .SUCCESS)
 
-    upload_buffer_mapped_rawptr: rawptr
-    assert(vk.MapMemory(device, cpu_allocation.memory, cpu_allocation.residents[{
-        handle = upload_buffer, is_image = false
-    }].offset, cpu_allocation.residents[{
-        handle = upload_buffer, is_image = false
-    }].size, {}, &upload_buffer_mapped_rawptr) == .SUCCESS)
+    cpu_allocation_mapped_rawptr: rawptr
+    assert(vk.MapMemory(device, cpu_allocation.memory, 0, cpu_allocation.size, {}, &cpu_allocation_mapped_rawptr) == .SUCCESS)
+    defer vk.UnmapMemory(device, cpu_allocation.memory)
 
-    upload_buffer_mapped := ([^]u8)(upload_buffer_mapped_rawptr)
-    intrinsics.mem_copy_non_overlapping(&upload_buffer_mapped[0], &vertex_data[0], size_of(vertex_data))
-    intrinsics.mem_copy_non_overlapping(&upload_buffer_mapped[size_of(vertex_data)], &index_data[0], size_of(index_data))
-
-    vk.UnmapMemory(device, cpu_allocation.memory)
+    cpu_allocation_mapped := ([^]u8)(cpu_allocation_mapped_rawptr)
+    intrinsics.mem_copy_non_overlapping(&cpu_allocation_mapped[cpu_allocation.residents[{
+        handle = upload_buffer, is_image = false
+    }].offset], &vertex_data[0], size_of(vertex_data))
+    intrinsics.mem_copy_non_overlapping(&cpu_allocation_mapped[cpu_allocation.residents[{
+        handle = upload_buffer, is_image = false
+    }].offset + size_of(vertex_data)], &index_data[0], size_of(index_data))
+    intrinsics.mem_copy_non_overlapping(&cpu_allocation_mapped[cpu_allocation.residents[{
+        handle = upload_buffer, is_image = false
+    }].offset + size_of(vertex_data) + size_of(index_data)], &voxel_data[0], size_of(voxel_data))
 
     assert(vk.ResetCommandPool(device, command_pool, {}) == .SUCCESS)
     assert(vk.BeginCommandBuffer(command_buffer, &{
@@ -1004,12 +1051,32 @@ main :: proc() {
         },
     }
 
+    pre_copy_texture_memory_barriers := [1]vk.ImageMemoryBarrier {
+        {
+            sType = .IMAGE_MEMORY_BARRIER,
+            srcAccessMask = {},
+            dstAccessMask = { .TRANSFER_WRITE },
+            oldLayout = .UNDEFINED,
+            newLayout = .TRANSFER_DST_OPTIMAL,
+            srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+            image = voxel_texture,
+            subresourceRange = {
+                aspectMask = { .COLOR },
+                baseMipLevel = 0,
+                levelCount = 1,
+                baseArrayLayer = 0,
+                layerCount = 1,
+            },
+        },
+    }
+
     vk.CmdPipelineBarrier(
         command_buffer,
         { .TOP_OF_PIPE }, { .TRANSFER }, {},
         0, nil,
         u32(len(pre_copy_buffer_memory_barriers)), &pre_copy_buffer_memory_barriers[0],
-        0, nil
+        u32(len(pre_copy_texture_memory_barriers)), &pre_copy_texture_memory_barriers[0]
     )
 
     vk.CmdCopyBuffer(command_buffer,
@@ -1027,6 +1094,28 @@ main :: proc() {
             srcOffset = size_of(vertex_data),
             dstOffset = 0,
             size = size_of(index_data),
+        }
+    )
+
+    vk.CmdCopyBufferToImage(command_buffer,
+        upload_buffer, voxel_texture,
+        .TRANSFER_DST_OPTIMAL,
+        1, &vk.BufferImageCopy {
+            bufferOffset = size_of(vertex_data) + size_of(index_data),
+            bufferRowLength = 4,
+            bufferImageHeight = 4,
+            imageSubresource = {
+                aspectMask = { .COLOR },
+                mipLevel = 0,
+                baseArrayLayer = 0,
+                layerCount = 1,
+            },
+            imageOffset = { x = 0, y = 0, z = 0 },
+            imageExtent = {
+                width = 4,
+                height = 4,
+                depth = 4,
+            },
         }
     )
 
@@ -1057,16 +1146,26 @@ main :: proc() {
     }
     defer vk.DestroyShaderModule(device, fragment_shader_module, nil)
 
-    graphics_pipeline_descriptor_set_layout: vk.DescriptorSetLayout
-    result = vk.CreateDescriptorSetLayout(device, &{
-        sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        bindingCount = 1,
-        pBindings = &vk.DescriptorSetLayoutBinding {
+    graphics_pipeline_descriptor_set_layout_bindings := [2]vk.DescriptorSetLayoutBinding {
+        {
             binding = 0,
+            descriptorType = .UNIFORM_BUFFER,
+            descriptorCount = 1,
+            stageFlags = { .VERTEX, .FRAGMENT },
+        },
+        {
+            binding = 1,
             descriptorType = .STORAGE_IMAGE,
             descriptorCount = 1,
             stageFlags = { .FRAGMENT },
         }
+    }
+
+    graphics_pipeline_descriptor_set_layout: vk.DescriptorSetLayout
+    result = vk.CreateDescriptorSetLayout(device, &{
+        sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        bindingCount = u32(len(graphics_pipeline_descriptor_set_layout_bindings)),
+        pBindings = &graphics_pipeline_descriptor_set_layout_bindings[0],
     }, nil, &graphics_pipeline_descriptor_set_layout)
     assert(result == .SUCCESS)
     defer vk.DestroyDescriptorSetLayout(device, graphics_pipeline_descriptor_set_layout, nil)
@@ -1158,8 +1257,8 @@ main :: proc() {
         pRasterizationState = &{
             sType = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
             polygonMode = .FILL,
-            cullMode = {},
-            frontFace = .COUNTER_CLOCKWISE,
+            cullMode = { .BACK },
+            frontFace = .CLOCKWISE,
             lineWidth = 1.0,
         },
         pMultisampleState = &{
@@ -1200,15 +1299,23 @@ main :: proc() {
     assert(result == .SUCCESS)
     defer vk.DestroyPipeline(device, graphics_pipeline, nil)
 
+    graphics_pipeline_descriptor_pool_sizes := [2]vk.DescriptorPoolSize {
+        {
+            type = .UNIFORM_BUFFER,
+            descriptorCount = 1,
+        },
+        {
+            type = .STORAGE_IMAGE,
+            descriptorCount = 1,
+        },
+    }
+
     graphics_pipeline_descriptor_pool: vk.DescriptorPool
     result = vk.CreateDescriptorPool(device, &{
         sType = .DESCRIPTOR_POOL_CREATE_INFO,
         maxSets = 1,
-        poolSizeCount = 1,
-        pPoolSizes = &vk.DescriptorPoolSize {
-            type = .STORAGE_IMAGE,
-            descriptorCount = 1,
-        },
+        poolSizeCount = u32(len(graphics_pipeline_descriptor_pool_sizes)),
+        pPoolSizes = &graphics_pipeline_descriptor_pool_sizes[0],
     }, nil, &graphics_pipeline_descriptor_pool)
     assert(result == .SUCCESS)
     defer vk.DestroyDescriptorPool(device, graphics_pipeline_descriptor_pool, nil)
@@ -1221,20 +1328,41 @@ main :: proc() {
         pSetLayouts = &graphics_pipeline_descriptor_set_layout,
     }, &graphics_pipeline_descriptor_set)
     assert(result == .SUCCESS)
-    
-    vk.UpdateDescriptorSets(device, 1, &vk.WriteDescriptorSet {
-        sType = .WRITE_DESCRIPTOR_SET,
-        dstSet = graphics_pipeline_descriptor_set,
-        dstBinding = 0,
-        dstArrayElement = 0,
-        descriptorCount = 1,
-        descriptorType = .STORAGE_IMAGE,
-        pImageInfo = &{
-            imageView = voxel_texture_view,
-            imageLayout = .GENERAL,
-        },
-    }, 0, nil)
 
+    graphics_pipeline_descriptor_set_write_sets := [2]vk.WriteDescriptorSet {
+        {
+            sType = .WRITE_DESCRIPTOR_SET,
+            dstSet = graphics_pipeline_descriptor_set,
+            dstBinding = 0,
+            dstArrayElement = 0,
+            descriptorCount = 1,
+            descriptorType = .UNIFORM_BUFFER,
+            pBufferInfo = &vk.DescriptorBufferInfo {
+                buffer = uniform_buffer,
+                offset = 0,
+                range = size_of(UniformData),
+            },
+        },
+        {
+            sType = .WRITE_DESCRIPTOR_SET,
+            dstSet = graphics_pipeline_descriptor_set,
+            dstBinding = 1,
+            dstArrayElement = 0,
+            descriptorCount = 1,
+            descriptorType = .STORAGE_IMAGE,
+            pImageInfo = &vk.DescriptorImageInfo {
+                imageView = voxel_texture_view,
+                imageLayout = .GENERAL,
+                sampler = 0,
+            },
+        },
+    }
+
+    vk.UpdateDescriptorSets(device, u32(len(graphics_pipeline_descriptor_set_write_sets)), &graphics_pipeline_descriptor_set_write_sets[0], 0, nil)
+
+    uniform_data := (^UniformData)(&([^]u8)(cpu_allocation_mapped_rawptr)[cpu_allocation.residents[{ handle = uniform_buffer, is_image = false }].offset])
+
+    debug_value := u32(0)
     swapchain_enabled := true
     main_loop: for true {
         event: sdl3.Event
@@ -1308,7 +1436,42 @@ main :: proc() {
                     }
                 }, nil, &depth_texture_view)
                 assert(result == .SUCCESS)
+            } else if event.type == .KEY_DOWN {
+                #partial switch event.key.scancode {
+                    case ._0:  debug_value = 0
+                    case ._1:  debug_value = 1
+                    case ._2:  debug_value = 2
+                    case ._3:  debug_value = 3
+                    case ._4:  debug_value = 4
+                    case ._5:  debug_value = 5
+                    case ._6:  debug_value = 6
+                    case ._7:  debug_value = 7
+                    case ._8:  debug_value = 8
+                    case ._9:  debug_value = 9
+                }
             }
+        }
+
+        uniform_data^ = {
+            mvp_matrix = linalg.mul(
+                linalg.matrix4_perspective(1.6, f32(surface_capabilities.currentExtent.width) / f32(surface_capabilities.currentExtent.height), 0.01, 100.0, flip_z_axis = false),
+                linalg.mul(
+                    linalg.matrix4_translate(linalg.Vector3f32 { 0, 0, 2 }),
+                    linalg.mul(
+                        linalg.matrix4_rotate(f32(sdl3.GetTicks()) / 1000.0, linalg.Vector3f32 { 0.0, 1.0, 0.0 }),
+                        linalg.matrix4_rotate(-math.π / 4, linalg.Vector3f32 { 1.0, 0.0, 1.0 }),
+                    ),
+                ),
+                //linalg.MATRIX4F32_IDENTITY,
+            ),
+            box_size = {
+                4, 4, 4,
+            },
+            debug_value = debug_value,
+            screen_size = {
+                f32(surface_capabilities.currentExtent.width),
+                f32(surface_capabilities.currentExtent.height),
+            },
         }
 
         if swapchain_enabled {
