@@ -768,11 +768,11 @@ main :: proc() {
             height = 4,
             depth = 4,
         },
-        mipLevels = 3,
+        mipLevels = 1,
         arrayLayers = 1,
         samples = { ._1 },
         tiling = .OPTIMAL,
-        usage = { .STORAGE, .TRANSFER_DST },
+        usage = { .SAMPLED, .TRANSFER_DST },
         sharingMode = .EXCLUSIVE,
         initialLayout = .UNDEFINED,
     }, nil, &voxel_texture)
@@ -1155,7 +1155,7 @@ main :: proc() {
         },
         {
             binding = 1,
-            descriptorType = .STORAGE_IMAGE,
+            descriptorType = .SAMPLED_IMAGE,
             descriptorCount = 1,
             stageFlags = { .FRAGMENT },
         }
@@ -1305,7 +1305,7 @@ main :: proc() {
             descriptorCount = 1,
         },
         {
-            type = .STORAGE_IMAGE,
+            type = .SAMPLED_IMAGE,
             descriptorCount = 1,
         },
     }
@@ -1349,10 +1349,10 @@ main :: proc() {
             dstBinding = 1,
             dstArrayElement = 0,
             descriptorCount = 1,
-            descriptorType = .STORAGE_IMAGE,
+            descriptorType = .SAMPLED_IMAGE,
             pImageInfo = &vk.DescriptorImageInfo {
                 imageView = voxel_texture_view,
-                imageLayout = .GENERAL,
+                imageLayout = .SHADER_READ_ONLY_OPTIMAL,
                 sampler = 0,
             },
         },
@@ -1609,7 +1609,7 @@ main :: proc() {
                     srcAccessMask = {},
                     dstAccessMask = { .SHADER_READ },
                     oldLayout = .UNDEFINED,
-                    newLayout = .GENERAL,
+                    newLayout = .SHADER_READ_ONLY_OPTIMAL,
                     image = voxel_texture,
                     subresourceRange = {
                         aspectMask = { .COLOR },

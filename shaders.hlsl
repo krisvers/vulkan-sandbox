@@ -28,19 +28,18 @@ struct FragmentOutput {
 };
 
 [[vk::binding(1, 0)]]
-[[vk::image_format("r8ui")]]
-RWTexture3D<uint> rVoxelTexture;
+Texture3D<uint> rVoxelTexture;
 
 FragmentOutput fragment_main(VertexOutput vout) {
-    int3 coord = int3(vout.box_coord * box_size);
-    uint value = rVoxelTexture.Load(coord);
+    FragmentOutput fout;
 
+    int3 coord = int3(vout.box_coord * box_size);
     float2 ndcXY = vout.position.xy / screen_size;
     float2 renderXY = ndcXY * float2(2.0, -2.0) - float2(1.0, -1.0);
     //float3 ray = 
 
-    FragmentOutput fout;
     if (debug_value == 0) {
+        uint value = rVoxelTexture.Load(int4(0, 0, 0, 0), 0);
         fout.color = float4(float3(value, value, value), 1.0);
     } else if (debug_value == 1) {
         fout.color = float4(ndcXY, 0.0, 1.0);
