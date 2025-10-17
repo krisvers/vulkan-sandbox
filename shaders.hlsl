@@ -21,7 +21,7 @@ cbuffer UniformBuffer {
 VertexOutput vertex_main(VertexInput vin) {
     VertexOutput vout;
     vout.position = mul(mvp_matrix, float4(vin.position, 1.0));
-    vout.box_coord = vin.position * box_size - 1e-4;
+    vout.box_coord = vin.position * box_size - 1e-5;
     return vout;
 }
 
@@ -39,8 +39,8 @@ FragmentOutput fragment_main(VertexOutput vout) {
     float camera_fov = camera_info.w;
     float aspect_ratio = screen_size.x / screen_size.y;
 
-    float3 local_right = mul(float4(-1.0, 0.0, 0.0, 0.0), camera_to_local_matrix).xyz;
-    float3 local_up = mul(float4(0.0, -1.0, 0.0, 0.0), camera_to_local_matrix).xyz;
+    float3 local_right = mul(float4(1.0, 0.0, 0.0, 0.0), camera_to_local_matrix).xyz;
+    float3 local_up = mul(float4(0.0, 1.0, 0.0, 0.0), camera_to_local_matrix).xyz;
     float3 local_forward = mul(float4(0.0, 0.0, 1.0, 0.0), camera_to_local_matrix).xyz;
 
     int3 coord = int3(vout.box_coord);
@@ -51,8 +51,8 @@ FragmentOutput fragment_main(VertexOutput vout) {
     float half_width = half_height * aspect_ratio;
     float2 p = render_xy * float2(half_width, half_height);
 
-    float3 local_camera_position = mul(float4(camera_position, 1.0), camera_to_local_matrix).xyz;
-    float3 ray = normalize(local_forward + p.x * local_right + p.y * local_up);
+    float3 local_camera_position = mul(float4(camera_position, 1.0), camera_to_local_matrix).xyz * float3(1.0, 1.0, 1.0);
+    float3 ray = normalize(local_forward + p.x * local_right + p.y * local_up) * float3(1.0, 1.0, 1.0);
 
     /* adapted from https://web.archive.org/web/20121024081332/www.xnawiki.com/index.php?title=Voxel_traversal */
     //int3 origin = int3(originf - 0.5);
@@ -103,33 +103,49 @@ FragmentOutput fragment_main(VertexOutput vout) {
         tdelta.z = 1e100;
     }
 
-    if (debug_value == 0) {
+    if (debug_value == 0 || debug_value == 9) {
         while (true) {
-            if (xyz.x < 0 || xyz.y < 0 || xyz.z < 0 ||
-                xyz.x >= box_size.x || xyz.y >= box_size.y || xyz.z >= box_size.z) {
-                break;
-            }
-
-            if (tmax.x < tmax.y && tmax.x < tmax.z) {
-                xyz.x += step.x;
-                tmax.x += tdelta.x;
-            } else if (tmax.y < tmax.z) {
-                xyz.y += step.y;
-                tmax.y += tdelta.y;
+            if (tmax.x < tmax.y) {
+                if (tmax.x < tmax.z) {
+                    xyz.x += step.x;
+                    if (xyz.x < 0 || xyz.x >= box_size.x) {
+                        break;
+                    }
+                    tmax.x += tdelta.x;
+                } else {
+                    xyz.z += step.z;
+                    if (xyz.z < 0 || xyz.z >= box_size.z) {
+                        break;
+                    }
+                    tmax.z += tdelta.z;
+                }
             } else {
-                xyz.z += step.z;
-                tmax.z += tdelta.z;
-            }
-
-            if (xyz.x < 0 || xyz.y < 0 || xyz.z < 0 ||
-                xyz.x >= box_size.x || xyz.y >= box_size.y || xyz.z >= box_size.z) {
-                break;
+                if (tmax.y < tmax.z) {
+                    xyz.y += step.y;
+                    if (xyz.y < 0 || xyz.y >= box_size.y) {
+                        break;
+                    }
+                    tmax.y += tdelta.y;
+                } else {
+                    xyz.z += step.z;
+                    if (xyz.z < 0 || xyz.z >= box_size.z) {
+                        break;
+                    }
+                    tmax.z += tdelta.z;
+                }
             }
 
             uint value = rVoxelTexture.Load(int4(xyz, 0), 0);
-            float valuef = float(value) / 255.0;
-            fout.color = float4(float3(0.0, valuef, 0.0), 1.0);
-            return fout;
+            if (value != 0) {
+                if (debug_value == 9) {
+                    fout.color = float4(float3(xyz) / float3(box_size), 1.0);
+                    return fout;
+                }
+
+                float valuef = float(value) / 255.0;
+                fout.color = float4(float3(0.0, valuef, 0.0), 1.0);
+                return fout;
+            }
         }
         
         fout.color = float4(float3(1.0, 0.0, 1.0), 1.0);

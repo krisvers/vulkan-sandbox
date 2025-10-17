@@ -1318,8 +1318,8 @@ main :: proc() {
         pRasterizationState = &{
             sType = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
             polygonMode = .FILL,
-            cullMode = { .FRONT },
-            frontFace = .CLOCKWISE,
+            cullMode = { .BACK },
+            frontFace = .COUNTER_CLOCKWISE,
             lineWidth = 1.0,
         },
         pMultisampleState = &{
@@ -1532,10 +1532,9 @@ main :: proc() {
                     box_rotation[1] -= event.motion.xrel / 1000.0
                 }
             } else if event.type == .MOUSE_WHEEL {
-                s := i32(event.wheel.y * 10) % 10
+                s := i32(event.wheel.y * 9) % 10
                 if s == 0 || event.wheel.x >= 1.5 {
-                    s = i32(event.wheel.x * 10) % 10
-                    fmt.println("horizontal scroll: ", s)
+                    s = i32(event.wheel.x * 9) % 10
                     if s == 0 {
                         continue
                     }
@@ -1554,15 +1553,15 @@ main :: proc() {
 
         uniform_data^ = {
             mvp_matrix = linalg.mul(
-                linalg.matrix4_perspective(1.6, f32(surface_capabilities.currentExtent.width) / f32(surface_capabilities.currentExtent.height), 0.01, 100.0, flip_z_axis = false),
+                linalg.matrix4_perspective(1.6, f32(surface_capabilities.currentExtent.width) / f32(surface_capabilities.currentExtent.height), 0.01, 100.0, flip_z_axis = true),
                 linalg.mul(
-                    linalg.matrix4_translate(linalg.Vector3f32 { -camera_position[0], -camera_position[1], -camera_position[2] }),
+                    linalg.matrix4_translate(linalg.Vector3f32 { -camera_position[0], -camera_position[1], camera_position[2] }),
                     linalg.mul(
-                        linalg.matrix4_rotate(box_rotation[0], linalg.Vector3f32 { 1.0, 0.0, 0.0 }),
+                        linalg.matrix4_rotate(-box_rotation[0], linalg.Vector3f32 { 1.0, 0.0, 0.0 }),
                         linalg.mul(
-                            linalg.matrix4_rotate(box_rotation[1], linalg.Vector3f32 { 0.0, 1.0, 0.0 }),
+                            linalg.matrix4_rotate(-box_rotation[1], linalg.Vector3f32 { 0.0, 1.0, 0.0 }),
                             linalg.mul(
-                                linalg.matrix4_rotate(box_rotation[2], linalg.Vector3f32 { 0.0, 0.0, 1.0 }),
+                                linalg.matrix4_rotate(-box_rotation[2], linalg.Vector3f32 { 0.0, 0.0, 1.0 }),
                                 linalg.matrix4_translate(linalg.Vector3f32 { -0.5, -0.5, -0.5 }),
                             ),
                         ),
@@ -1582,18 +1581,13 @@ main :: proc() {
                 f32(surface_capabilities.currentExtent.width),
                 f32(surface_capabilities.currentExtent.height),
             },
-            camera_to_local_matrix = linalg.matrix4_inverse(
+            camera_to_local_matrix = linalg.mul(
+                linalg.matrix4_rotate(box_rotation[0], linalg.Vector3f32 { 1.0, 0.0, 0.0 }),
                 linalg.mul(
-                    linalg.matrix4_scale(linalg.Vector3f32 { 1.0, 1.0, 1.0 }),
+                    linalg.matrix4_rotate(box_rotation[1], linalg.Vector3f32 { 0.0, 1.0, 0.0 }),
                     linalg.mul(
-                        linalg.matrix4_rotate(box_rotation[0], linalg.Vector3f32 { 1.0, 0.0, 0.0 }),
-                        linalg.mul(
-                            linalg.matrix4_rotate(box_rotation[1], linalg.Vector3f32 { 0.0, 1.0, 0.0 }),
-                            linalg.mul(
-                                linalg.matrix4_rotate(box_rotation[2], linalg.Vector3f32 { 0.0, 0.0, 1.0 }),
-                                linalg.matrix4_translate(linalg.Vector3f32 { -0.5, -0.5, -0.5 }),
-                            ),
-                        ),
+                        linalg.matrix4_rotate(box_rotation[2], linalg.Vector3f32 { 0.0, 0.0, 1.0 }),
+                        linalg.matrix4_translate(linalg.Vector3f32 { 0.5, 0.5, 0.5 }),
                     ),
                 ),
             ),
