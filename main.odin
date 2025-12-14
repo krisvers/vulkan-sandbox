@@ -7,30 +7,25 @@ import "core:fmt"
 import vk "vendor:vulkan"
 import "vendor:sdl3"
 import "vendor:directx/dxc"
+
+import "vendor:miniaudio"
+import "vendor:stb/vorbis"
+
 import "core:c"
 import "core:strings"
 import "core:unicode/utf16"
 import "core:math/linalg"
 import "core:math"
+import "core:os"
 
-CONTAINER_WIDTH :: 8
-CONTAINER_HEIGHT :: 8
-CONTAINER_DEPTH :: 8
+AUDIO_RENDER_BUFFER_SIZE :: 32768
+AUDIO_LOCAL_BUFFER_SIZE :: 268435456 //16777216
+AUDIO_OUTPUT_SAMPLE_FREQUENCY :: 44100
+AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE :: 4
 
 when ODIN_OS == .Darwin {
     @(export)
     foreign import moltenvk "MoltenVK"
-}
-
-UniformData :: struct {
-    mvp_matrix: matrix[4, 4]f32,
-    box_size: [3]u32,
-    debug_value: u32,
-    screen_size: [2]f32,
-    _padding0: [2]u32,
-    camera_to_local_matrix: matrix[4, 4]f32,
-    camera_position: [3]f32,
-    camera_fov: f32,
 }
 
 MemoryResidentHandle :: union {
@@ -82,11 +77,11 @@ resize_swapchain :: proc(
         imageColorSpace = .SRGB_NONLINEAR,
         imageExtent = surface_capabilites.currentExtent,
         imageArrayLayers = 1,
-        imageUsage = { .COLOR_ATTACHMENT },
+        imageUsage = { .STORAGE, .TRANSFER_DST },
         imageSharingMode = .EXCLUSIVE,
         preTransform = { .IDENTITY },
         compositeAlpha = { .OPAQUE },
-        presentMode = .FIFO,
+        presentMode = .IMMEDIATE,
         oldSwapchain = old_swapchain,
     }, nil, swapchain)
     assert(result == .SUCCESS)
@@ -271,7 +266,7 @@ allocate_for_resources :: proc(
 
 bind_resources_to_allocation_auto :: proc(
     device: vk.Device,
-    allocation: MemoryAllocation,
+    allocation: ^MemoryAllocation,
 ) -> (result := vk.Result.SUCCESS) {
     for id, resident in allocation.residents {
         r: vk.Result
@@ -478,7 +473,256 @@ compile_hlsl :: proc(
     return module, .SUCCESS
 }
 
+AudioUniforms :: struct #packed {
+    cpu_read_ptr: u32,
+    seek: u32,
+    paused: b32,
+    sample_frequency: u32,
+
+    dispatch_dimensions: [3]u32,
+
+    _padding: u32,
+
+    sequence0: u32,
+    sequence1: u32,
+    sequence2: u32,
+    sequence3: u32,
+    sequence4: u32,
+    sequence5: u32,
+    sequence6: u32,
+    sequence7: u32,
+    sequence8: u32,
+    sequence9: u32,
+    sequence10: u32,
+    sequence11: u32,
+
+    counter0: u16,
+    counter1: u16,
+    counter2: u16,
+    counter3: u16,
+    counter4: u16,
+    counter5: u16,
+    counter6: u16,
+    counter7: u16,
+
+    input_track_count: u32,
+}
+
+AudioCPUSide :: struct {
+    allocation: MemoryAllocation,
+    allocation_mapped: rawptr,
+
+    rendered_buffer: vk.Buffer,
+    rendered_buffer_mapped: ^f32,
+
+    transfer_buffer: vk.Buffer,
+    transfer_buffer_mapped: ^f32,
+
+    uniform_buffer: vk.Buffer,
+    uniform_buffer_mapped: ^AudioUniforms,
+
+    local_buffer: []f32,
+}
+
+AudioGPUSide :: struct {
+    allocation: MemoryAllocation,
+}
+
+MAData :: struct {
+    gpu: ^AudioGPUSide,
+    cpu: ^AudioCPUSide,
+}
+
+ma_data_callback :: proc "c" (device: ^miniaudio.device, output: rawptr, input: rawptr, frame_count: u32) {
+    context = runtime.default_context()
+    data := (^MAData)(device.pUserData)
+    assert(data != nil)
+
+    size := frame_count * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE * 2
+    //assert(size <= AUDIO_RENDER_BUFFER_SIZE)
+
+    //decoder := data.decoder
+    fmt.println(data.cpu.uniform_buffer_mapped.seek, ' ', f32(data.cpu.uniform_buffer_mapped.seek) / f32(AUDIO_OUTPUT_SAMPLE_FREQUENCY), " (", data.cpu.uniform_buffer_mapped.counter0, ", ", data.cpu.uniform_buffer_mapped.counter1, ", ", data.cpu.uniform_buffer_mapped.counter2, ", ", data.cpu.uniform_buffer_mapped.counter3, ", ", data.cpu.uniform_buffer_mapped.counter4, ", ", data.cpu.uniform_buffer_mapped.counter5, ", ", data.cpu.uniform_buffer_mapped.counter6, ", ", data.cpu.uniform_buffer_mapped.counter7, ")", sep="")
+    if !data.cpu.uniform_buffer_mapped.paused {
+        intrinsics.mem_copy_non_overlapping(output, &data.cpu.local_buffer[(data.cpu.uniform_buffer_mapped.seek * 2) % (u32(len(data.cpu.local_buffer)))], size)
+        //intrinsics.mem_copy_non_overlapping(output, data.cpu.rendered_buffer_mapped, size)
+
+        data.cpu.uniform_buffer_mapped.seek += frame_count
+        //miniaudio.decoder_read_pcm_frames(decoder, output, u64(frame_count), nil)
+    }
+}
+
+ma_log_callback :: proc "c" (user_data: rawptr, level: u32, message: cstring) {
+    context = runtime.default_context()
+    fmt.println("[", miniaudio.log_level(level), "]: ", message, sep="")
+}
+
+
+load_tracks :: proc (paths: []string, device: vk.Device, physical_device: vk.PhysicalDevice, queue: vk.Queue, command_pool: vk.CommandPool, command_buffer: vk.CommandBuffer, transfer_buffer: vk.Buffer, transfer_size: vk.DeviceSize, transfer_buffer_mapped: rawptr) -> (MemoryAllocation, []MemoryResidentID) {
+    ma_decoder_config := miniaudio.decoder_config_init(.f32, 2, AUDIO_OUTPUT_SAMPLE_FREQUENCY)
+
+    ma_decoders := make([]miniaudio.decoder, len(paths))
+    defer delete(ma_decoders)
+
+    residents := make([]MemoryResidentID, len(paths))
+    for i in 0..<len(paths) {
+        assert(miniaudio.decoder_init_file(strings.unsafe_string_to_cstring(paths[i]), &ma_decoder_config, &ma_decoders[i]) == .SUCCESS)
+
+        frame_count: u64
+        assert(miniaudio.decoder_get_length_in_pcm_frames(&ma_decoders[i], &frame_count) == .SUCCESS)
+
+        residents[i].is_image = false
+        residents[i].handle = vk.Buffer(0)
+        result := vk.CreateBuffer(device, &{
+            sType = .BUFFER_CREATE_INFO,
+            size = vk.DeviceSize(frame_count * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE * 2),
+            usage = { .TRANSFER_DST, .STORAGE_BUFFER },
+        }, nil, &residents[i].handle.(vk.Buffer))
+        assert(result == .SUCCESS)
+    }
+
+    defer for &d in ma_decoders {
+        miniaudio.decoder_uninit(&d)
+    }
+
+    allocation, result := allocate_for_resources(device, physical_device, residents, { .DEVICE_LOCAL })
+    assert(result == .SUCCESS)
+    assert(bind_resources_to_allocation(device, &allocation) == .SUCCESS)
+
+    for i in 0..<len(residents) {
+        fmt.println("   ", i, "-", allocation.residents[residents[i]].size / AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE / 2, "frames or", allocation.residents[residents[i]].size, "bytes at offset", allocation.residents[residents[i]].offset)
+    }
+
+    upload_index := 0
+    global_byte_index := vk.DeviceSize(0)
+    for {
+        /* pack data into transfer buffer */
+        start_resource_index := max(int)
+        start_resource_max_frame_count := vk.DeviceSize(0)
+        local_byte_index := vk.DeviceSize(0)
+
+        for i in 0..<len(residents) {
+            if global_byte_index < allocation.residents[residents[i]].offset {
+                global_byte_index = allocation.residents[residents[i]].offset
+            }
+
+            if global_byte_index >= allocation.residents[residents[i]].offset && global_byte_index < (allocation.residents[residents[i]].offset + allocation.residents[residents[i]].size) {
+                start_resource_index = i
+                local_byte_index = global_byte_index - allocation.residents[residents[i]].offset
+                start_resource_max_frame_count = min(allocation.residents[residents[i]].size - local_byte_index, transfer_size) / AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE / 2
+                break
+            }
+        }
+
+        if start_resource_index == max(int) {
+            fmt.println("failed to find goldilocks for global:", global_byte_index)
+            break
+        }
+
+        fmt.println(start_resource_index, "decoding", start_resource_max_frame_count, "frames or", start_resource_max_frame_count * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE * 2, "bytes at", local_byte_index, "global:", global_byte_index)
+
+        assert(miniaudio.decoder_read_pcm_frames(&ma_decoders[start_resource_index], transfer_buffer_mapped, u64(start_resource_max_frame_count), nil) == .SUCCESS)
+
+        assert(vk.ResetCommandPool(device, command_pool, {}) == .SUCCESS)
+        assert(vk.BeginCommandBuffer(command_buffer, &{
+            sType = .COMMAND_BUFFER_BEGIN_INFO,
+        }) == .SUCCESS)
+
+        if upload_index == 0 {
+            pre_copy_buffer_memory_barriers := make([]vk.BufferMemoryBarrier, len(paths) + 1)
+            pre_copy_buffer_memory_barriers[len(paths)] = {
+                sType = .BUFFER_MEMORY_BARRIER,
+                srcAccessMask = {},
+                dstAccessMask = { .TRANSFER_READ },
+                buffer = transfer_buffer,
+                offset = 0,
+                size = transfer_size,
+            }
+
+            i := 0
+            for id, &resident in allocation.residents {
+                pre_copy_buffer_memory_barriers[i] = {
+                    sType = .BUFFER_MEMORY_BARRIER,
+                    srcAccessMask = {},
+                    dstAccessMask = { .TRANSFER_WRITE },
+                    buffer = id.handle.(vk.Buffer),
+                    offset = 0,
+                    size = resident.size,
+                }
+                i += 1
+            }
+
+            vk.CmdPipelineBarrier(
+                command_buffer,
+                { .TOP_OF_PIPE }, { .TRANSFER }, {},
+                0, nil,
+                u32(len(pre_copy_buffer_memory_barriers)), &pre_copy_buffer_memory_barriers[0],
+                0, nil
+            )
+        }
+
+        vk.CmdCopyBuffer(command_buffer,
+            transfer_buffer, residents[start_resource_index].handle.(vk.Buffer),
+            1, &vk.BufferCopy {
+                srcOffset = 0,
+                dstOffset = local_byte_index,
+                size = vk.DeviceSize(start_resource_max_frame_count * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE * 2),
+            }
+        )
+
+        cmd_buffer := command_buffer
+        assert(vk.EndCommandBuffer(command_buffer) == .SUCCESS)
+        assert(vk.QueueSubmit(queue, 1, &vk.SubmitInfo {
+            sType = .SUBMIT_INFO,
+            waitSemaphoreCount = 0,
+            pWaitSemaphores = nil,
+            pWaitDstStageMask = nil,
+            commandBufferCount = 1,
+            pCommandBuffers = &cmd_buffer,
+            signalSemaphoreCount = 0,
+            pSignalSemaphores = nil,
+        }, 0) == .SUCCESS)
+        assert(vk.QueueWaitIdle(queue) == .SUCCESS)
+
+        global_byte_index = allocation.residents[residents[start_resource_index]].offset + local_byte_index + start_resource_max_frame_count * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE * 2
+        upload_index += 1
+    }
+
+    return allocation, residents
+}
+
 main :: proc() {
+    ma_data := MAData {}
+
+    ma_log: miniaudio.log
+    assert(miniaudio.log_init(nil, &ma_log) == .SUCCESS)
+    assert(miniaudio.log_register_callback(&ma_log, {
+        onLog = ma_log_callback,
+    }) == .SUCCESS)
+    defer miniaudio.log_uninit(&ma_log)
+
+    ma_context_config := miniaudio.context_config_init()
+    ma_context_config.pLog = &ma_log
+
+    ma_context: miniaudio.context_type
+    assert(miniaudio.context_init(nil, 0, &ma_context_config, &ma_context) == .SUCCESS)
+    defer miniaudio.context_uninit(&ma_context)
+
+    ma_device_config := miniaudio.device_config_init(.playback)
+    ma_device_config.playback.format = .f32
+    ma_device_config.playback.channels = 2
+    ma_device_config.sampleRate = AUDIO_OUTPUT_SAMPLE_FREQUENCY
+    ma_device_config.dataCallback = ma_data_callback
+    ma_device_config.pUserData = &ma_data
+
+    ma_device: miniaudio.device
+    assert(miniaudio.device_init(&ma_context, &ma_device_config, &ma_device) == .SUCCESS)
+    defer miniaudio.device_uninit(&ma_device)
+
+    //ma_data.decoders = make([dynamic]miniaudio.decoder, 1, 16)
+    //assert(miniaudio.decoder_init_file("sound.wav", nil, &ma_data.decoders[0]) == .SUCCESS)
+    //defer miniaudio.decoder_uninit(ma_data.decoder)
+
     assert(sdl3.Init({ .VIDEO }))
     assert(sdl3.Vulkan_LoadLibrary(nil))
 
@@ -503,9 +747,8 @@ main :: proc() {
     available_instance_extension_count: u32
     assert(vk.EnumerateInstanceExtensionProperties(nil, &available_instance_extension_count, nil) == .SUCCESS)
 
-    available_instance_extensions := []vk.ExtensionProperties {}
+    available_instance_extensions := make([]vk.ExtensionProperties, available_instance_extension_count)
     if available_instance_extension_count > 0 {
-        available_instance_extensions = make([]vk.ExtensionProperties, available_instance_extension_count)
         assert(vk.EnumerateInstanceExtensionProperties(nil, &available_instance_extension_count, &available_instance_extensions[0]) == .SUCCESS)
     }
 
@@ -542,6 +785,7 @@ main :: proc() {
         enabledExtensionCount = u32(len(instance_extensions)),
         ppEnabledExtensionNames = &instance_extensions[0]
     }, nil, &instance)
+    delete(instance_layers)
     delete(instance_extensions)
     delete(available_instance_extensions)
     assert(result == .SUCCESS)
@@ -564,7 +808,7 @@ main :: proc() {
     assert(result == .SUCCESS)
     defer vk.DestroyDebugUtilsMessengerEXT(instance, debug_utils_messenger, nil)
 
-    window := sdl3.CreateWindow("voxels", 1200, 900, { .VULKAN, .RESIZABLE })
+    window := sdl3.CreateWindow(strings.unsafe_string_to_cstring(os.args[1]), 1200, 900, { .VULKAN, .RESIZABLE })
     assert(window != nil)
     defer sdl3.DestroyWindow(window)
 
@@ -637,6 +881,17 @@ main :: proc() {
         pnext = &dynamic_rendering_features
     }
 
+    descriptor_indexing_features := vk.PhysicalDeviceDescriptorIndexingFeatures {
+        sType = .PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+        pNext = pnext,
+        shaderStorageBufferArrayNonUniformIndexing = true,
+        descriptorBindingStorageBufferUpdateAfterBind = true,
+        descriptorBindingVariableDescriptorCount = true,
+        descriptorBindingPartiallyBound = true,
+    }
+
+    pnext = &descriptor_indexing_features
+
     when ODIN_OS == .Darwin {
         append(&device_extensions, "VK_KHR_portability_subset")
     }
@@ -661,6 +916,7 @@ main :: proc() {
         ppEnabledExtensionNames = &device_extensions[0],
         pEnabledFeatures = &physical_device_features,
     }, nil, &device)
+    delete(available_device_extensions)
     delete(device_extensions)
     assert(result == .SUCCESS)
     defer vk.DestroyDevice(device, nil)
@@ -699,11 +955,11 @@ main :: proc() {
         imageColorSpace = .SRGB_NONLINEAR,
         imageExtent = surface_capabilities.currentExtent,
         imageArrayLayers = 1,
-        imageUsage = { .COLOR_ATTACHMENT },
+        imageUsage = { .STORAGE, .TRANSFER_DST },
         imageSharingMode = .EXCLUSIVE,
         preTransform = surface_capabilities.currentTransform,
         compositeAlpha = { .OPAQUE },
-        presentMode = .FIFO,
+        presentMode = .IMMEDIATE,
     }, nil, &swapchain)
     assert(result == .SUCCESS)
     defer vk.DestroySwapchainKHR(device, swapchain, nil)
@@ -712,6 +968,8 @@ main :: proc() {
     assert(vk.GetSwapchainImagesKHR(device, swapchain, &swapchain_image_count, nil) == .SUCCESS)
 
     swapchain_images := make([dynamic]vk.Image, swapchain_image_count)
+    defer delete(swapchain_images)
+
     assert(vk.GetSwapchainImagesKHR(device, swapchain, &swapchain_image_count, &swapchain_images[0]) == .SUCCESS)
 
     swapchain_image_views := make([dynamic]vk.ImageView, swapchain_image_count)
@@ -767,207 +1025,6 @@ main :: proc() {
     assert(result == .SUCCESS)
     defer vk.DestroyFence(device, in_flight_fence, nil)
 
-    voxel_texture: vk.Image
-    result = vk.CreateImage(device, &{
-        sType = .IMAGE_CREATE_INFO,
-        imageType = .D3,
-        format = .R8_UINT,
-        extent = {
-            width = CONTAINER_WIDTH,
-            height = CONTAINER_HEIGHT,
-            depth = CONTAINER_DEPTH,
-        },
-        mipLevels = 1,
-        arrayLayers = 1,
-        samples = { ._1 },
-        tiling = .OPTIMAL,
-        usage = { .SAMPLED, .TRANSFER_DST },
-        sharingMode = .EXCLUSIVE,
-        initialLayout = .UNDEFINED,
-    }, nil, &voxel_texture)
-    assert(result == .SUCCESS)
-
-    voxel_data := [CONTAINER_WIDTH * CONTAINER_HEIGHT * CONTAINER_DEPTH]u8 {
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F,
-        0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-        
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    }
-
-    vertex_data := [24]f32 {
-        0, 0, 0,
-        0, 0, 1,
-        0, 1, 0,
-        0, 1, 1,
-        1, 0, 0,
-        1, 0, 1,
-        1, 1, 0,
-        1, 1, 1,
-    }
-
-    index_data := [36]u32 {
-        0, 1, 2,
-        1, 3, 2,
-        5, 4, 7,
-        4, 6, 7,
-        4, 0, 6,
-        0, 2, 6,
-        1, 5, 3,
-        5, 7, 3,
-        2, 3, 6,
-        3, 7, 6,
-        4, 5, 0,
-        5, 1, 0,
-    }
-
-    vertex_buffer: vk.Buffer
-    result = vk.CreateBuffer(device, &{
-        sType = .BUFFER_CREATE_INFO,
-        size = size_of(vertex_data),
-        usage = { .VERTEX_BUFFER, .TRANSFER_DST },
-    }, nil, &vertex_buffer)
-
-    index_buffer: vk.Buffer
-    result = vk.CreateBuffer(device, &{
-        sType = .BUFFER_CREATE_INFO,
-        size = size_of(index_data),
-        usage = { .INDEX_BUFFER, .TRANSFER_DST },
-    }, nil, &index_buffer)
-
-    gpu_resource_allocation_residents := []MemoryResidentID {
-        {
-            handle = vertex_buffer,
-            is_image = false,
-        },
-        {
-            handle = index_buffer,
-            is_image = false,
-        },
-        {
-            handle = voxel_texture,
-            is_image = true,
-        },
-    }
-
-    gpu_asset_allocation, gpu_asset_allocation_result := allocate_for_resources(device, physical_device, gpu_resource_allocation_residents, { .DEVICE_LOCAL })
-    assert(gpu_asset_allocation_result == .SUCCESS)
-    defer {
-        vk.DestroyBuffer(device, index_buffer, nil)
-        vk.DestroyBuffer(device, vertex_buffer, nil)
-        vk.DestroyImage(device, voxel_texture, nil)
-        destroy_allocation(device, &gpu_asset_allocation)
-    }
-
-    assert(bind_resources_to_allocation(device, gpu_asset_allocation) == .SUCCESS)
-
-    voxel_texture_view: vk.ImageView
-    result = vk.CreateImageView(device, &{
-        sType = .IMAGE_VIEW_CREATE_INFO,
-        image = voxel_texture,
-        viewType = .D3,
-        format = .R8_UINT,
-        components = {
-            r = .IDENTITY,
-            g = .IDENTITY,
-            b = .IDENTITY,
-            a = .IDENTITY,
-        },
-        subresourceRange = {
-            aspectMask = { .COLOR },
-            baseMipLevel = 0,
-            levelCount = 1,
-            baseArrayLayer = 0,
-            layerCount = 1,
-        }
-    }, nil, &voxel_texture_view)
-    assert(result == .SUCCESS)
-    defer vk.DestroyImageView(device, voxel_texture_view, nil)
-
-    voxel_texture_sampler: vk.Sampler
-    result = vk.CreateSampler(device, &{
-        sType = .SAMPLER_CREATE_INFO,
-        magFilter = .NEAREST,
-        minFilter = .NEAREST,
-        mipmapMode = .NEAREST,
-        addressModeU = .CLAMP_TO_EDGE,
-        addressModeV = .CLAMP_TO_EDGE,
-        addressModeW = .CLAMP_TO_EDGE,
-        mipLodBias = 0.0,
-        maxAnisotropy = 1.0,
-        compareOp = .ALWAYS,
-        minLod = 0.0,
-        maxLod = 3.0,
-    }, nil, &voxel_texture_sampler)
-    assert(result == .SUCCESS)
-    defer vk.DestroySampler(device, voxel_texture_sampler, nil)
-
     depth_texture: vk.Image
     result = vk.CreateImage(device, &{
         sType = .IMAGE_CREATE_INFO,
@@ -1005,7 +1062,7 @@ main :: proc() {
         destroy_allocation(device, &gpu_screen_allocation)
     }
 
-    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+    assert(bind_resources_to_allocation(device, &gpu_screen_allocation) == .SUCCESS)
 
     depth_texture_view: vk.ImageView
     result = vk.CreateImageView(device, &{
@@ -1030,106 +1087,154 @@ main :: proc() {
     assert(result == .SUCCESS)
     defer vk.DestroyImageView(device, depth_texture_view, nil)
 
-    upload_buffer: vk.Buffer
-    result = vk.CreateBuffer(device, &{
-        sType = .BUFFER_CREATE_INFO,
-        size = size_of(vertex_data) + size_of(index_data) + size_of(voxel_data),
-        usage = { .TRANSFER_SRC },
-    }, nil, &upload_buffer)
+    /*
+    ma_decoder_config := miniaudio.decoder_config_init(.f32, 2, AUDIO_OUTPUT_SAMPLE_FREQUENCY)
 
-    uniform_buffer: vk.Buffer
+    ma_decoder: miniaudio.decoder
+    assert(miniaudio.decoder_init_file(strings.unsafe_string_to_cstring(os.args[1]), &ma_decoder_config, &ma_decoder) == .SUCCESS)
+    defer miniaudio.decoder_uninit(&ma_decoder)
+
+    frame_count: u64
+    assert(miniaudio.decoder_get_length_in_pcm_frames(&ma_decoder, &frame_count) == .SUCCESS)
+    */
+
+    audio_cpu := AudioCPUSide {}
+    audio_gpu := AudioGPUSide {}
+
     result = vk.CreateBuffer(device, &{
         sType = .BUFFER_CREATE_INFO,
-        size = size_of(UniformData),
+        size = AUDIO_RENDER_BUFFER_SIZE,
+        usage = { .STORAGE_BUFFER },
+    }, nil, &audio_cpu.rendered_buffer)
+    assert(result == .SUCCESS)
+
+    result = vk.CreateBuffer(device, &{
+        sType = .BUFFER_CREATE_INFO,
+        size = vk.DeviceSize(AUDIO_LOCAL_BUFFER_SIZE),
+        usage = { .TRANSFER_SRC, .TRANSFER_DST },
+    }, nil, &audio_cpu.transfer_buffer)
+    assert(result == .SUCCESS)
+
+    result = vk.CreateBuffer(device, &{
+        sType = .BUFFER_CREATE_INFO,
+        size = size_of(AudioUniforms),
         usage = { .UNIFORM_BUFFER },
-    }, nil, &uniform_buffer)
+    }, nil, &audio_cpu.uniform_buffer)
+    assert(result == .SUCCESS)
 
-    cpu_allocation_residents := []MemoryResidentID {
+    audio_cpu_residents := []MemoryResidentID {
         {
-            handle = uniform_buffer,
+            handle = audio_cpu.rendered_buffer,
             is_image = false,
         },
         {
-            handle = upload_buffer,
+            handle = audio_cpu.transfer_buffer,
             is_image = false,
         },
+        {
+            handle = audio_cpu.uniform_buffer,
+            is_image = false,
+        }
     }
-    
-    cpu_allocation, cpu_allocation_result := allocate_for_resources(device, physical_device, cpu_allocation_residents, { .HOST_VISIBLE, .HOST_COHERENT })
-    assert(cpu_allocation_result == .SUCCESS)
+
+    audio_cpu.allocation, result = allocate_for_resources(device, physical_device, audio_cpu_residents, { .HOST_VISIBLE, .HOST_COHERENT })
+    assert(result == .SUCCESS)
     defer {
-        vk.DestroyBuffer(device, uniform_buffer, nil)
-        vk.DestroyBuffer(device, upload_buffer, nil)
-        destroy_allocation(device, &cpu_allocation)
+        vk.DestroyBuffer(device, audio_cpu.uniform_buffer, nil)
+        vk.DestroyBuffer(device, audio_cpu.transfer_buffer, nil)
+        vk.DestroyBuffer(device, audio_cpu.rendered_buffer, nil)
+        destroy_allocation(device, &audio_cpu.allocation)
     }
 
-    assert(bind_resources_to_allocation(device, cpu_allocation) == .SUCCESS)
+    assert(bind_resources_to_allocation(device, &audio_cpu.allocation) == .SUCCESS)
+    assert(vk.MapMemory(device, audio_cpu.allocation.memory, 0, audio_cpu.allocation.size, {}, &audio_cpu.allocation_mapped) == .SUCCESS)
+    defer vk.UnmapMemory(device, audio_cpu.allocation.memory)
 
-    cpu_allocation_mapped_rawptr: rawptr
-    assert(vk.MapMemory(device, cpu_allocation.memory, 0, cpu_allocation.size, {}, &cpu_allocation_mapped_rawptr) == .SUCCESS)
-    defer vk.UnmapMemory(device, cpu_allocation.memory)
+    audio_cpu.rendered_buffer_mapped = (^f32)(&(([^]u8)(audio_cpu.allocation_mapped)[audio_cpu.allocation.residents[{
+        handle = audio_cpu.rendered_buffer,
+        is_image = false,
+    }].offset]))
 
-    cpu_allocation_mapped := ([^]u8)(cpu_allocation_mapped_rawptr)
-    intrinsics.mem_copy_non_overlapping(&cpu_allocation_mapped[cpu_allocation.residents[{
-        handle = upload_buffer, is_image = false
-    }].offset], &vertex_data[0], size_of(vertex_data))
-    intrinsics.mem_copy_non_overlapping(&cpu_allocation_mapped[cpu_allocation.residents[{
-        handle = upload_buffer, is_image = false
-    }].offset + size_of(vertex_data)], &index_data[0], size_of(index_data))
-    intrinsics.mem_copy_non_overlapping(&cpu_allocation_mapped[cpu_allocation.residents[{
-        handle = upload_buffer, is_image = false
-    }].offset + size_of(vertex_data) + size_of(index_data)], &voxel_data[0], size_of(voxel_data))
+    audio_cpu.transfer_buffer_mapped = (^f32)(&(([^]u8)(audio_cpu.allocation_mapped)[audio_cpu.allocation.residents[{
+        handle = audio_cpu.transfer_buffer,
+        is_image = false,
+    }].offset]))
+
+    audio_cpu.uniform_buffer_mapped = (^AudioUniforms)(&(([^]u8)(audio_cpu.allocation_mapped)[audio_cpu.allocation.residents[{
+        handle = audio_cpu.uniform_buffer,
+        is_image = false,
+    }].offset]))
+
+    /*
+    result = vk.CreateBuffer(device, &{
+        sType = .BUFFER_CREATE_INFO,
+        size = vk.DeviceSize(frame_count * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE * 2),
+        usage = { .TRANSFER_DST, .STORAGE_BUFFER },
+    }, nil, &audio_gpu.sampled_buffer)
+    assert(result == .SUCCESS)
+
+    audio_gpu_residents := []MemoryResidentID {
+        {
+            handle = audio_gpu.sampled_buffer,
+            is_image = false,
+        },
+    }
+
+    audio_gpu.allocation, result = allocate_for_resources(device, physical_device, audio_gpu_residents, { .DEVICE_LOCAL })
+    assert(result == .SUCCESS)
+    defer {
+        vk.DestroyBuffer(device, audio_gpu.sampled_buffer, nil)
+        destroy_allocation(device, &audio_gpu.allocation)
+    }
+
+    assert(bind_resources_to_allocation(device, &audio_gpu.allocation) == .SUCCESS)
+    */
+    
+    t := audio_cpu.allocation.residents[{
+        handle = audio_cpu.transfer_buffer,
+        is_image = false,
+    }]
+
+    input_track_allocation, input_track_order := load_tracks(os.args[2:], device, physical_device, queue, command_pool, command_buffer, audio_cpu.transfer_buffer, t.size, audio_cpu.transfer_buffer_mapped)
+    defer {
+        for id, &resident in input_track_allocation.residents {
+            vk.DestroyBuffer(device, id.handle.(vk.Buffer), nil)
+        }
+        destroy_allocation(device, &input_track_allocation)
+        delete(input_track_order)
+    }
+
+    /*
+    assert(miniaudio.decoder_read_pcm_frames(&ma_decoder, audio_cpu.transfer_buffer_mapped, frame_count, nil) == .SUCCESS)
 
     assert(vk.ResetCommandPool(device, command_pool, {}) == .SUCCESS)
     assert(vk.BeginCommandBuffer(command_buffer, &{
         sType = .COMMAND_BUFFER_BEGIN_INFO,
     }) == .SUCCESS)
 
-    pre_copy_buffer_memory_barriers := [3]vk.BufferMemoryBarrier {
+    pre_copy_buffer_memory_barriers := [?]vk.BufferMemoryBarrier {
         {
             sType = .BUFFER_MEMORY_BARRIER,
             srcAccessMask = {},
             dstAccessMask = { .TRANSFER_READ },
-            buffer = upload_buffer,
+            buffer = audio_cpu.transfer_buffer,
             offset = 0,
-            size = cpu_allocation.residents[{ handle = upload_buffer, is_image = false }].size,
+            size = audio_cpu.allocation.residents[{
+                handle = audio_cpu.transfer_buffer,
+                is_image = false
+            }].size,
         },
         {
             sType = .BUFFER_MEMORY_BARRIER,
             srcAccessMask = {},
             dstAccessMask = { .TRANSFER_WRITE },
-            buffer = vertex_buffer,
+            buffer = audio_gpu.sampled_buffer,
             offset = 0,
-            size = gpu_asset_allocation.residents[{ handle = vertex_buffer, is_image = false }].size,
-        },
-        {
-            sType = .BUFFER_MEMORY_BARRIER,
-            srcAccessMask = {},
-            dstAccessMask = { .TRANSFER_WRITE },
-            buffer = index_buffer,
-            offset = 0,
-            size = gpu_asset_allocation.residents[{ handle = index_buffer, is_image = false }].size,
-        },
-    }
-
-    pre_copy_texture_memory_barriers := [1]vk.ImageMemoryBarrier {
-        {
-            sType = .IMAGE_MEMORY_BARRIER,
-            srcAccessMask = {},
-            dstAccessMask = { .TRANSFER_WRITE },
-            oldLayout = .UNDEFINED,
-            newLayout = .TRANSFER_DST_OPTIMAL,
-            srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
-            dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
-            image = voxel_texture,
-            subresourceRange = {
-                aspectMask = { .COLOR },
-                baseMipLevel = 0,
-                levelCount = 1,
-                baseArrayLayer = 0,
-                layerCount = 1,
-            },
-        },
+            size = audio_gpu.allocation.residents[{
+                handle = audio_gpu.sampled_buffer,
+                is_image = false
+            }].size,
+        }
     }
 
     vk.CmdPipelineBarrier(
@@ -1137,46 +1242,15 @@ main :: proc() {
         { .TOP_OF_PIPE }, { .TRANSFER }, {},
         0, nil,
         u32(len(pre_copy_buffer_memory_barriers)), &pre_copy_buffer_memory_barriers[0],
-        u32(len(pre_copy_texture_memory_barriers)), &pre_copy_texture_memory_barriers[0]
+        0, nil
     )
 
     vk.CmdCopyBuffer(command_buffer,
-        upload_buffer, vertex_buffer,
+        audio_cpu.transfer_buffer, audio_gpu.sampled_buffer,
         1, &vk.BufferCopy {
             srcOffset = 0,
             dstOffset = 0,
-            size = size_of(vertex_data),
-        }
-    )
-
-    vk.CmdCopyBuffer(command_buffer,
-        upload_buffer, index_buffer,
-        1, &vk.BufferCopy {
-            srcOffset = size_of(vertex_data),
-            dstOffset = 0,
-            size = size_of(index_data),
-        }
-    )
-
-    vk.CmdCopyBufferToImage(command_buffer,
-        upload_buffer, voxel_texture,
-        .TRANSFER_DST_OPTIMAL,
-        1, &vk.BufferImageCopy {
-            bufferOffset = size_of(vertex_data) + size_of(index_data),
-            bufferRowLength = CONTAINER_WIDTH,
-            bufferImageHeight = CONTAINER_HEIGHT,
-            imageSubresource = {
-                aspectMask = { .COLOR },
-                mipLevel = 0,
-                baseArrayLayer = 0,
-                layerCount = 1,
-            },
-            imageOffset = { x = 0, y = 0, z = 0 },
-            imageExtent = {
-                width = CONTAINER_WIDTH,
-                height = CONTAINER_HEIGHT,
-                depth = CONTAINER_DEPTH,
-            },
+            size = vk.DeviceSize(frame_count * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE * 2),
         }
     )
 
@@ -1191,8 +1265,125 @@ main :: proc() {
         signalSemaphoreCount = 0,
         pSignalSemaphores = nil,
     }, 0) == .SUCCESS)
-
     assert(vk.QueueWaitIdle(queue) == .SUCCESS)
+    */
+
+    audio_cpu.local_buffer = make_slice([]f32, AUDIO_LOCAL_BUFFER_SIZE / AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE) // u32(len(audio_cpu.local_buffer)) / AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE)
+    defer delete_slice(audio_cpu.local_buffer)
+
+    audio_shader_source_hlsl := cstring(#load("audio.hlsl"))
+    audio_shader_module, audio_shader_compilation_result := compile_hlsl(device, dxc_utils, dxc_compiler, audio_shader_source_hlsl, "process_audio", { .COMPUTE })
+    if audio_shader_compilation_result != .SUCCESS {
+        fmt.panicf("Failed to compile audio processing compute shader from audio.hlsl: %s", audio_shader_compilation_result)
+    }
+    defer vk.DestroyShaderModule(device, audio_shader_module, nil)
+
+    audio_pipeline_descriptor_set_layout_bindings := [?]vk.DescriptorSetLayoutBinding {
+        {
+            binding = 0,
+            descriptorType = .STORAGE_BUFFER,
+            descriptorCount = 1,
+            stageFlags = { .COMPUTE },
+        },
+        {
+            binding = 1,
+            descriptorType = .UNIFORM_BUFFER,
+            descriptorCount = 1,
+            stageFlags = { .COMPUTE },
+        },
+        {
+            binding = 2,
+            descriptorType = .STORAGE_IMAGE,
+            descriptorCount = 1,
+            stageFlags = { .COMPUTE },
+        },
+        {
+            binding = 3,
+            descriptorType = .STORAGE_BUFFER,
+            descriptorCount = 4093,
+            stageFlags = { .COMPUTE },
+        },
+    }
+
+    audio_pipeline_descriptor_binding_flags := [?]vk.DescriptorBindingFlags {
+        {},
+        {},
+        {},
+        { .PARTIALLY_BOUND, .UPDATE_AFTER_BIND, },
+    }
+
+    audio_pipeline_descriptor_set_layout: vk.DescriptorSetLayout
+    result = vk.CreateDescriptorSetLayout(device, &{
+        sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        flags = { .UPDATE_AFTER_BIND_POOL },
+        pNext = &vk.DescriptorSetLayoutBindingFlagsCreateInfo {
+            sType = .DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+            bindingCount = u32(len(audio_pipeline_descriptor_binding_flags)),
+            pBindingFlags = &audio_pipeline_descriptor_binding_flags[0],
+        },
+        bindingCount = u32(len(audio_pipeline_descriptor_set_layout_bindings)),
+        pBindings = &audio_pipeline_descriptor_set_layout_bindings[0],
+    }, nil, &audio_pipeline_descriptor_set_layout)
+    assert(result == .SUCCESS)
+    defer vk.DestroyDescriptorSetLayout(device, audio_pipeline_descriptor_set_layout, nil)
+
+    audio_pipeline_layout: vk.PipelineLayout
+    result = vk.CreatePipelineLayout(device, &{
+        sType = .PIPELINE_LAYOUT_CREATE_INFO,
+        setLayoutCount = 1,
+        pSetLayouts = &audio_pipeline_descriptor_set_layout,
+    }, nil, &audio_pipeline_layout)
+    assert(result == .SUCCESS)
+    defer vk.DestroyPipelineLayout(device, audio_pipeline_layout, nil)
+
+    audio_pipeline: vk.Pipeline
+    result = vk.CreateComputePipelines(device, 0, 1, &vk.ComputePipelineCreateInfo {
+        sType = .COMPUTE_PIPELINE_CREATE_INFO,
+        stage = {
+            sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage = { .COMPUTE },
+            module = audio_shader_module,
+            pName = "process_audio",
+        },
+        layout = audio_pipeline_layout,
+    }, nil, &audio_pipeline)
+    assert(result == .SUCCESS)
+    defer vk.DestroyPipeline(device, audio_pipeline, nil)
+
+    audio_pipeline_descriptor_pool_sizes := [?]vk.DescriptorPoolSize {
+        {
+            type = .UNIFORM_BUFFER,
+            descriptorCount = 1,
+        },
+        {
+            type = .STORAGE_IMAGE,
+            descriptorCount = 1,
+        },
+        {
+            type = .STORAGE_BUFFER,
+            descriptorCount = 4094,
+        },
+    }
+
+    audio_pipeline_descriptor_pool: vk.DescriptorPool
+    result = vk.CreateDescriptorPool(device, &{
+        sType = .DESCRIPTOR_POOL_CREATE_INFO,
+        flags = { .UPDATE_AFTER_BIND, },
+        maxSets = 1,
+        poolSizeCount = u32(len(audio_pipeline_descriptor_pool_sizes)),
+        pPoolSizes = &audio_pipeline_descriptor_pool_sizes[0],
+    }, nil, &audio_pipeline_descriptor_pool)
+    assert(result == .SUCCESS)
+    defer vk.DestroyDescriptorPool(device, audio_pipeline_descriptor_pool, nil)
+
+    audio_pipeline_descriptor_set: vk.DescriptorSet
+    result = vk.AllocateDescriptorSets(device, &{
+        sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
+        descriptorPool = audio_pipeline_descriptor_pool,
+        descriptorSetCount = 1,
+        pSetLayouts = &audio_pipeline_descriptor_set_layout,
+    }, &audio_pipeline_descriptor_set)
+    assert(result == .SUCCESS)
 
     shader_source_hlsl := cstring(#load("shaders.hlsl"))
     vertex_shader_module, vertex_shader_compilation_result := compile_hlsl(device, dxc_utils, dxc_compiler, shader_source_hlsl, "vertex_main", { .VERTEX })
@@ -1207,19 +1398,21 @@ main :: proc() {
     }
     defer vk.DestroyShaderModule(device, fragment_shader_module, nil)
 
-    graphics_pipeline_descriptor_set_layout_bindings := [2]vk.DescriptorSetLayoutBinding {
+    graphics_pipeline_descriptor_set_layout_bindings := [?]vk.DescriptorSetLayoutBinding {
         {
             binding = 0,
             descriptorType = .UNIFORM_BUFFER,
             descriptorCount = 1,
             stageFlags = { .VERTEX, .FRAGMENT },
         },
+        /*
         {
             binding = 1,
             descriptorType = .SAMPLED_IMAGE,
             descriptorCount = 1,
             stageFlags = { .FRAGMENT },
         }
+        */
     }
 
     graphics_pipeline_descriptor_set_layout: vk.DescriptorSetLayout
@@ -1278,18 +1471,18 @@ main :: proc() {
         pStages = &graphics_pipeline_shader_stages[0],
         pVertexInputState = &{
             sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            vertexBindingDescriptionCount = 1,
-            pVertexBindingDescriptions = &vk.VertexInputBindingDescription {
+            vertexBindingDescriptionCount = 0,
+            pVertexBindingDescriptions = nil, /* &vk.VertexInputBindingDescription {
                 binding = 0,
                 stride = 3 * size_of(f32),
                 inputRate = .VERTEX,
-            },
-            vertexAttributeDescriptionCount = 1,
-            pVertexAttributeDescriptions = &vk.VertexInputAttributeDescription {
+            }, */
+            vertexAttributeDescriptionCount = 0,
+            pVertexAttributeDescriptions = nil, /* &vk.VertexInputAttributeDescription {
                 location = 0,
                 binding = 0,
                 format = .R32G32B32_SFLOAT,
-            },
+            }, */
         },
         pInputAssemblyState = &{
             sType = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -1318,7 +1511,7 @@ main :: proc() {
         pRasterizationState = &{
             sType = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
             polygonMode = .FILL,
-            cullMode = { .BACK },
+            cullMode = {},
             frontFace = .COUNTER_CLOCKWISE,
             lineWidth = 1.0,
         },
@@ -1328,8 +1521,8 @@ main :: proc() {
         },
         pDepthStencilState = &{
             sType = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-            depthTestEnable = true,
-            depthWriteEnable = true,
+            depthTestEnable = false,
+            depthWriteEnable = false,
             depthCompareOp = .LESS,
             minDepthBounds = 0.0,
             maxDepthBounds = 1.0,
@@ -1360,15 +1553,17 @@ main :: proc() {
     assert(result == .SUCCESS)
     defer vk.DestroyPipeline(device, graphics_pipeline, nil)
 
-    graphics_pipeline_descriptor_pool_sizes := [2]vk.DescriptorPoolSize {
+    graphics_pipeline_descriptor_pool_sizes := [?]vk.DescriptorPoolSize {
         {
             type = .UNIFORM_BUFFER,
             descriptorCount = 1,
         },
+        /*
         {
             type = .SAMPLED_IMAGE,
             descriptorCount = 1,
         },
+        */
     }
 
     graphics_pipeline_descriptor_pool: vk.DescriptorPool
@@ -1390,7 +1585,8 @@ main :: proc() {
     }, &graphics_pipeline_descriptor_set)
     assert(result == .SUCCESS)
 
-    graphics_pipeline_descriptor_set_write_sets := [2]vk.WriteDescriptorSet {
+    graphics_pipeline_descriptor_set_write_sets := [?]vk.WriteDescriptorSet {
+        /*
         {
             sType = .WRITE_DESCRIPTOR_SET,
             dstSet = graphics_pipeline_descriptor_set,
@@ -1417,23 +1613,131 @@ main :: proc() {
                 sampler = 0,
             },
         },
+        */
     }
 
-    vk.UpdateDescriptorSets(device, u32(len(graphics_pipeline_descriptor_set_write_sets)), &graphics_pipeline_descriptor_set_write_sets[0], 0, nil)
+    //vk.UpdateDescriptorSets(device, u32(len(graphics_pipeline_descriptor_set_write_sets)), &graphics_pipeline_descriptor_set_write_sets[0], 0, nil)
 
-    uniform_data := (^UniformData)(&([^]u8)(cpu_allocation_mapped_rawptr)[cpu_allocation.residents[{ handle = uniform_buffer, is_image = false }].offset])
+    //uniform_data := (^UniformData)(&([^]u8)(cpu_allocation_mapped_rawptr)[cpu_allocation.residents[{ handle = uniform_buffer, is_image = false }].offset])
 
-    saved_mouse_pos: [3]f32
-    right_click := false
-    camera_position := [3]f32 { 0.0, 0.0, -2.0 }
-    box_rotation := [3]f32 {}
-    debug_value := u32(0)
+    audio_cpu.uniform_buffer_mapped.sequence0 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence1 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence2 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence3 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence4 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence5 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence6 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence7 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence8 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence9 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence10 = max(u32)
+    audio_cpu.uniform_buffer_mapped.sequence11 = max(u32)
+
+    audio_cpu.uniform_buffer_mapped.seek = 0
+    audio_cpu.uniform_buffer_mapped.input_track_count = u32(len(input_track_allocation.residents))
+    audio_cpu.uniform_buffer_mapped.sample_frequency = AUDIO_OUTPUT_SAMPLE_FREQUENCY
+
+    ma_data.cpu = &audio_cpu
+    ma_data.gpu = &audio_gpu
+    miniaudio.device_start(&ma_device)
+
+    visuals_enabled := true
     swapchain_enabled := true
     main_loop: for true {
         event: sdl3.Event
         for sdl3.PollEvent(&event) {
             if event.type == .QUIT {
                 break main_loop
+            } else if event.type == .KEY_DOWN {
+                #partial switch event.key.scancode {
+                    case .SPACE:
+                        audio_cpu.uniform_buffer_mapped.paused = !audio_cpu.uniform_buffer_mapped.paused
+                    case .LEFT:
+                        audio_cpu.uniform_buffer_mapped.seek = u32(max(0, int(audio_cpu.uniform_buffer_mapped.seek) - AUDIO_OUTPUT_SAMPLE_FREQUENCY * 5))
+                    case .RIGHT:
+                        audio_cpu.uniform_buffer_mapped.seek = u32(max(0, int(audio_cpu.uniform_buffer_mapped.seek) + AUDIO_OUTPUT_SAMPLE_FREQUENCY * 5))
+                    case .COMMA:
+                        audio_cpu.uniform_buffer_mapped.seek = u32(max(0, int(audio_cpu.uniform_buffer_mapped.seek) - 128))
+                    case .PERIOD:
+                        audio_cpu.uniform_buffer_mapped.seek = u32(max(0, int(audio_cpu.uniform_buffer_mapped.seek) + 128))
+                    case .RIGHTBRACKET:
+                        visuals_enabled = true
+                    case .LEFTBRACKET:
+                        visuals_enabled = false
+                    case .S:
+                        ma_encoder_config := miniaudio.encoder_config_init(.wav, .f32, 2, AUDIO_OUTPUT_SAMPLE_FREQUENCY)
+
+                        ma_encoder: miniaudio.encoder
+                        ma_result := miniaudio.encoder_init_file(strings.unsafe_string_to_cstring(os.args[1]), &ma_encoder_config, &ma_encoder)
+                        fmt.println(ma_result)
+                        assert(ma_result == .SUCCESS)
+                        assert(miniaudio.encoder_write_pcm_frames(&ma_encoder, &audio_cpu.local_buffer[0], min(u64(audio_cpu.uniform_buffer_mapped.seek), u64(len(audio_cpu.local_buffer) / 2)), nil) == .SUCCESS)
+                        miniaudio.encoder_uninit(&ma_encoder)
+                    case .Q:
+                        if audio_cpu.uniform_buffer_mapped.sequence0 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence0 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case ._2:
+                        if audio_cpu.uniform_buffer_mapped.sequence1 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence1 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case .W:
+                        if audio_cpu.uniform_buffer_mapped.sequence2 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence2 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case ._3:
+                        if audio_cpu.uniform_buffer_mapped.sequence3 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence3 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case .E:
+                        if audio_cpu.uniform_buffer_mapped.sequence4 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence4 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case .R:
+                        if audio_cpu.uniform_buffer_mapped.sequence5 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence5 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case ._5:
+                        if audio_cpu.uniform_buffer_mapped.sequence6 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence6 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case .T:
+                        if audio_cpu.uniform_buffer_mapped.sequence7 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence7 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case ._6:
+                        if audio_cpu.uniform_buffer_mapped.sequence8 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence8 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case .Y:
+                        if audio_cpu.uniform_buffer_mapped.sequence9 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence9 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case ._7:
+                        if audio_cpu.uniform_buffer_mapped.sequence10 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence10 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case .U:
+                        if audio_cpu.uniform_buffer_mapped.sequence11 == max(u32) {
+                            audio_cpu.uniform_buffer_mapped.sequence11 = audio_cpu.uniform_buffer_mapped.seek
+                        }
+                    case .Z:
+                        audio_cpu.uniform_buffer_mapped.counter0 += 1
+                    case .X:
+                        audio_cpu.uniform_buffer_mapped.counter1 += 1
+                    case .C:
+                        audio_cpu.uniform_buffer_mapped.counter2 += 1
+                    case .V:
+                        audio_cpu.uniform_buffer_mapped.counter3 += 1
+                    case .B:
+                        audio_cpu.uniform_buffer_mapped.counter4 += 1
+                    case .N:
+                        audio_cpu.uniform_buffer_mapped.counter5 += 1
+                    case .SEMICOLON:
+                        audio_cpu.uniform_buffer_mapped.counter6 += 1
+                    case .APOSTROPHE:
+                        audio_cpu.uniform_buffer_mapped.counter7 += 1
+                }
             } else if event.type == .WINDOW_RESIZED {
                 assert(vk.DeviceWaitIdle(device) == .SUCCESS)
                 surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
@@ -1473,7 +1777,7 @@ main :: proc() {
 
                     gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
                     assert(gpu_screen_allocation_result == .SUCCESS)
-                    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                    assert(bind_resources_to_allocation(device, &gpu_screen_allocation) == .SUCCESS)
                 } else {
                     replace_resource_in_allocation(device, &gpu_screen_allocation, gpu_screen_allocation_residents[0], {
                         handle = depth_texture,
@@ -1501,57 +1805,40 @@ main :: proc() {
                     }
                 }, nil, &depth_texture_view)
                 assert(result == .SUCCESS)
-            } else if event.type == .KEY_DOWN {
+            } else if (event.type == .KEY_UP) {
                 #partial switch event.key.scancode {
-                    case ._0:   debug_value = 0
-                    case ._1:   debug_value = 1
-                    case ._2:   debug_value = 2
-                    case ._3:   debug_value = 3
-                    case ._4:   debug_value = 4
-                    case ._5:   debug_value = 5
-                    case ._6:   debug_value = 6
-                    case ._7:   debug_value = 7
-                    case ._8:   debug_value = 8
-                    case ._9:   debug_value = 9
-                }
-            } else if event.type == .MOUSE_BUTTON_DOWN || event.type == .MOUSE_BUTTON_UP {
-                if event.button.button == 1 || event.button.button == 3 {
-                    right_click = event.type == .MOUSE_BUTTON_DOWN ? !right_click : right_click
-                    _ = sdl3.SetWindowRelativeMouseMode(window, right_click)
-                    if right_click {
-                        _ = sdl3.GetMouseState(&saved_mouse_pos[0], &saved_mouse_pos[1])
-                        _ = sdl3.HideCursor()
-                    } else {
-                        sdl3.WarpMouseInWindow(window, saved_mouse_pos[0], saved_mouse_pos[1])
-                        _ = sdl3.ShowCursor()
-                    }
-                }
-            } else if event.type == .MOUSE_MOTION {
-                if right_click {
-                    box_rotation[0] -= event.motion.yrel / 1000.0
-                    box_rotation[1] -= event.motion.xrel / 1000.0
-                }
-            } else if event.type == .MOUSE_WHEEL {
-                s := i32(event.wheel.y * 9) % 10
-                if s == 0 || event.wheel.x >= 1.5 {
-                    s = i32(event.wheel.x * 9) % 10
-                    if s == 0 {
-                        continue
-                    }
-
-                    box_rotation[2] += event.wheel.x / 10.0
-                    continue
-                }
-
-                if s < 0 {
-                    camera_position[2] *= f32(-s) / 20.0 + 1.0
-                } else {
-                    camera_position[2] /= f32(s) / 20.0 + 1.0
+                    case .Q:
+                        audio_cpu.uniform_buffer_mapped.sequence0 = max(u32)
+                    case ._2:
+                        audio_cpu.uniform_buffer_mapped.sequence1 = max(u32)
+                    case .W:
+                        audio_cpu.uniform_buffer_mapped.sequence2 = max(u32)
+                    case ._3:
+                        audio_cpu.uniform_buffer_mapped.sequence3 = max(u32)
+                    case .E:
+                        audio_cpu.uniform_buffer_mapped.sequence4 = max(u32)
+                    case .R:
+                        audio_cpu.uniform_buffer_mapped.sequence5 = max(u32)
+                    case ._5:
+                        audio_cpu.uniform_buffer_mapped.sequence6 = max(u32)
+                    case .T:
+                        audio_cpu.uniform_buffer_mapped.sequence7 = max(u32)
+                    case ._6:
+                        audio_cpu.uniform_buffer_mapped.sequence8 = max(u32)
+                    case .Y:
+                        audio_cpu.uniform_buffer_mapped.sequence9 = max(u32)
+                    case ._7:
+                        audio_cpu.uniform_buffer_mapped.sequence10 = max(u32)
+                    case .U:
+                        audio_cpu.uniform_buffer_mapped.sequence11 = max(u32)
                 }
             }
         }
 
+        aspect := f32(surface_capabilities.currentExtent.width) / f32(surface_capabilities.currentExtent.height);
+        /*
         uniform_data^ = {
+            /*
             mvp_matrix = linalg.mul(
                 linalg.matrix4_perspective(1.6, f32(surface_capabilities.currentExtent.width) / f32(surface_capabilities.currentExtent.height), 0.01, 100.0, flip_z_axis = true),
                 linalg.mul(
@@ -1593,14 +1880,19 @@ main :: proc() {
             ),
             camera_position = camera_position,
             camera_fov = 1.6,
+            */
+            view_matrix = linalg.matrix_ortho3d_f32(-aspect, aspect, -1.0, 1.0, 0.0, 1.0),
         }
+        */
 
+        vk.WaitForFences(device, 1, &in_flight_fence, true, max(u64))
         if swapchain_enabled {
-            vk.WaitForFences(device, 1, &in_flight_fence, true, max(u64))
-
             image_index: u32
-            result = vk.AcquireNextImageKHR(device, swapchain, max(u64), image_acquisition_semaphore, 0, &image_index)
-            if result == .ERROR_OUT_OF_DATE_KHR {assert(vk.DeviceWaitIdle(device) == .SUCCESS)
+            if visuals_enabled {
+               result = vk.AcquireNextImageKHR(device, swapchain, max(u64), image_acquisition_semaphore, 0, &image_index)
+            }
+            if result == .ERROR_OUT_OF_DATE_KHR {
+                assert(vk.DeviceWaitIdle(device) == .SUCCESS)
                 surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
                 
                 vk.DestroyImageView(device, depth_texture_view, nil)
@@ -1638,7 +1930,7 @@ main :: proc() {
                     
                     gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
                     assert(gpu_screen_allocation_result == .SUCCESS)
-                    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                    assert(bind_resources_to_allocation(device, &gpu_screen_allocation) == .SUCCESS)
                 } else {
                     replace_resource_in_allocation(device, &gpu_screen_allocation, gpu_screen_allocation_residents[0], {
                         handle = depth_texture,
@@ -1673,6 +1965,89 @@ main :: proc() {
 
             vk.ResetFences(device, 1, &in_flight_fence)
 
+            audio_pipeline_descriptor_buffer_infos := make([]vk.DescriptorBufferInfo, len(input_track_allocation.residents))
+            defer delete(audio_pipeline_descriptor_buffer_infos)
+
+            it_index := u32(0)
+            for id in input_track_order {
+                audio_pipeline_descriptor_buffer_infos[it_index] = {
+                    buffer = id.handle.(vk.Buffer),
+                    offset = 0,
+                    range = input_track_allocation.residents[id].size,
+                }
+
+                it_index += 1
+            }
+
+            audio_pipeline_write_descriptor_sets := [?]vk.WriteDescriptorSet {
+                {
+                    sType = .WRITE_DESCRIPTOR_SET,
+                    dstSet = audio_pipeline_descriptor_set,
+                    dstBinding = 0,
+                    dstArrayElement = 0,
+                    descriptorCount = 1,
+                    descriptorType = .STORAGE_BUFFER,
+                    pBufferInfo = &{
+                        buffer = audio_cpu.rendered_buffer,
+                        offset = 0,
+                        range = audio_cpu.allocation.residents[{
+                            handle = audio_cpu.rendered_buffer,
+                            is_image = false,
+                        }].size,
+                    },
+                },
+                {
+                    sType = .WRITE_DESCRIPTOR_SET,
+                    dstSet = audio_pipeline_descriptor_set,
+                    dstBinding = 1,
+                    dstArrayElement = 0,
+                    descriptorCount = 1,
+                    descriptorType = .UNIFORM_BUFFER,
+                    pBufferInfo = &{
+                        buffer = audio_cpu.uniform_buffer,
+                        offset = 0,
+                        range = audio_cpu.allocation.residents[{
+                            handle = audio_cpu.uniform_buffer,
+                            is_image = false,
+                        }].size,
+                    },
+                },
+                {
+                    sType = .WRITE_DESCRIPTOR_SET,
+                    dstSet = audio_pipeline_descriptor_set,
+                    dstBinding = 2,
+                    dstArrayElement = 0,
+                    descriptorCount = 1,
+                    descriptorType = .STORAGE_IMAGE,
+                    pImageInfo = &{
+                        sampler = 0,
+                        imageView = swapchain_image_views[image_index],
+                        imageLayout = .GENERAL,
+                    },
+                },
+                {
+                    sType = .WRITE_DESCRIPTOR_SET,
+                    dstSet = audio_pipeline_descriptor_set,
+                    dstBinding = 3,
+                    dstArrayElement = 0,
+                    descriptorCount = u32(len(audio_pipeline_descriptor_buffer_infos)),
+                    descriptorType = .STORAGE_BUFFER,
+                    pBufferInfo = &audio_pipeline_descriptor_buffer_infos[0],
+                },
+            }
+
+            vk.UpdateDescriptorSets(device,
+                u32(len(audio_pipeline_write_descriptor_sets)), &audio_pipeline_write_descriptor_sets[0],
+                0, nil
+            )
+
+            index := (audio_cpu.uniform_buffer_mapped.seek * 2) % (u32(len(audio_cpu.local_buffer)))
+            intrinsics.mem_copy_non_overlapping(&audio_cpu.local_buffer[index], audio_cpu.rendered_buffer_mapped, min(AUDIO_RENDER_BUFFER_SIZE, (u32(len(audio_cpu.local_buffer)) - index) * AUDIO_OUTPUT_SAMPLE_FORMAT_SIZE))
+
+            audio_cpu.uniform_buffer_mapped.dispatch_dimensions[0] = AUDIO_RENDER_BUFFER_SIZE / 32 / 32 / 2
+            audio_cpu.uniform_buffer_mapped.dispatch_dimensions[1] = 1
+            audio_cpu.uniform_buffer_mapped.dispatch_dimensions[2] = 1
+
             assert(vk.ResetCommandPool(device, command_pool, {}) == .SUCCESS)
             assert(vk.BeginCommandBuffer(command_buffer, &{
                 sType = .COMMAND_BUFFER_BEGIN_INFO,
@@ -1680,15 +2055,32 @@ main :: proc() {
             }) == .SUCCESS)
 
             vk.CmdPipelineBarrier(command_buffer,
-                { .TRANSFER }, { .COLOR_ATTACHMENT_OUTPUT }, {},
+                { .HOST }, { .COMPUTE_SHADER }, {},
+                0, nil,
+                1, &vk.BufferMemoryBarrier {
+                    sType = .BUFFER_MEMORY_BARRIER,
+                    srcAccessMask = { .HOST_READ },
+                    dstAccessMask = { .SHADER_WRITE },
+                    buffer = audio_cpu.rendered_buffer,
+                    offset = 0,
+                    size = audio_cpu.allocation.residents[{
+                        handle = audio_cpu.rendered_buffer,
+                        is_image = false,
+                    }].size,
+                },
+                0, nil
+            )
+
+            vk.CmdPipelineBarrier(command_buffer,
+                { .TRANSFER }, { .COMPUTE_SHADER }, {},
                 0, nil,
                 0, nil,
                 1, &vk.ImageMemoryBarrier {
                     sType = .IMAGE_MEMORY_BARRIER,
                     srcAccessMask = {},
-                    dstAccessMask = { .COLOR_ATTACHMENT_WRITE },
+                    dstAccessMask = { .SHADER_WRITE },
                     oldLayout = .UNDEFINED,
-                    newLayout = .COLOR_ATTACHMENT_OPTIMAL,
+                    newLayout = .GENERAL,
                     image = swapchain_images[image_index],
                     subresourceRange = {
                         aspectMask = { .COLOR },
@@ -1700,6 +2092,7 @@ main :: proc() {
                 }
             )
 
+            /*
             vk.CmdPipelineBarrier(command_buffer,
                 { .BOTTOM_OF_PIPE }, { .EARLY_FRAGMENT_TESTS }, {},
                 0, nil,
@@ -1807,51 +2200,100 @@ main :: proc() {
             vk.CmdBindIndexBuffer(command_buffer, index_buffer, 0, .UINT32)
             vk.CmdDrawIndexed(command_buffer, u32(len(index_data)), 1, 0, 0, 0)
 
-            vk.CmdEndRenderingKHR(command_buffer)
+            vk.CmdDraw(command_buffer, 6, 1, 0, 0)
 
-            vk.CmdPipelineBarrier(command_buffer,
-                { .COLOR_ATTACHMENT_OUTPUT }, { .TRANSFER }, {},
-                0, nil, 0, nil, 1, & vk.ImageMemoryBarrier {
-                sType = .IMAGE_MEMORY_BARRIER,
-                srcAccessMask = {},
-                dstAccessMask = {},
-                oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
-                newLayout = .PRESENT_SRC_KHR,
-                image = swapchain_images[image_index],
-                subresourceRange = {
+            vk.CmdEndRenderingKHR(command_buffer)
+            */
+
+            vk.CmdClearColorImage(command_buffer,
+                swapchain_images[image_index], .GENERAL,
+                &vk.ClearColorValue {
+                    uint32 = { 0, 0, 0, 1 },
+                },
+                1, &vk.ImageSubresourceRange {
                     aspectMask = { .COLOR },
                     baseMipLevel = 0,
                     levelCount = 1,
                     baseArrayLayer = 0,
                     layerCount = 1,
                 },
-            })
+            )
+
+            vk.CmdBindPipeline(command_buffer, .COMPUTE, audio_pipeline)
+            vk.CmdBindDescriptorSets(command_buffer, .COMPUTE, audio_pipeline_layout, 0, 1, &audio_pipeline_descriptor_set, 0, nil)
+            vk.CmdDispatch(command_buffer,
+                audio_cpu.uniform_buffer_mapped.dispatch_dimensions[0],
+                audio_cpu.uniform_buffer_mapped.dispatch_dimensions[1],
+                audio_cpu.uniform_buffer_mapped.dispatch_dimensions[2]
+            )
+
+            vk.CmdPipelineBarrier(command_buffer,
+                { .COMPUTE_SHADER }, { .TRANSFER }, {},
+                0, nil,
+                0, nil,
+                1, &vk.ImageMemoryBarrier {
+                    sType = .IMAGE_MEMORY_BARRIER,
+                    srcAccessMask = { .SHADER_WRITE },
+                    dstAccessMask = {},
+                    oldLayout = .GENERAL,
+                    newLayout = .PRESENT_SRC_KHR,
+                    image = swapchain_images[image_index],
+                    subresourceRange = {
+                        aspectMask = { .COLOR },
+                        baseMipLevel = 0,
+                        levelCount = 1,
+                        baseArrayLayer = 0,
+                        layerCount = 1,
+                    },
+                }
+            )
+
+            vk.CmdPipelineBarrier(command_buffer,
+                { .COMPUTE_SHADER }, { .HOST }, {},
+                0, nil,
+                1, &vk.BufferMemoryBarrier {
+                    sType = .BUFFER_MEMORY_BARRIER,
+                    srcAccessMask = { .SHADER_WRITE },
+                    dstAccessMask = { .HOST_READ },
+                    buffer = audio_cpu.rendered_buffer,
+                    offset = 0,
+                    size = audio_cpu.allocation.residents[{
+                        handle = audio_cpu.rendered_buffer,
+                        is_image = false,
+                    }].size,
+                },
+                0, nil
+            )
+
             assert(vk.EndCommandBuffer(command_buffer) == .SUCCESS)
 
-            wait_stage := vk.PipelineStageFlags { .COLOR_ATTACHMENT_OUTPUT }
+            wait_stage := visuals_enabled ? vk.PipelineStageFlags { .TRANSFER } : vk.PipelineStageFlags { .COMPUTE_SHADER }
             assert(vk.QueueSubmit(queue, 1, &vk.SubmitInfo {
                 sType = .SUBMIT_INFO,
-                waitSemaphoreCount = 1,
-                pWaitSemaphores = &image_acquisition_semaphore,
+                waitSemaphoreCount = visuals_enabled ? 1 : 0,
+                pWaitSemaphores = visuals_enabled ? &image_acquisition_semaphore : nil,
                 commandBufferCount = 1,
                 pCommandBuffers = &command_buffer,
-                signalSemaphoreCount = 1,
-                pSignalSemaphores = &swapchain_image_finished_semaphores[image_index],
+                signalSemaphoreCount = visuals_enabled ? 1 : 0,
+                pSignalSemaphores = visuals_enabled ? &swapchain_image_finished_semaphores[image_index] : nil,
                 pWaitDstStageMask = &wait_stage,
             }, in_flight_fence) == .SUCCESS)
 
-            present_results: vk.Result
-            result = vk.QueuePresentKHR(queue, &{
-                sType = .PRESENT_INFO_KHR,
-                waitSemaphoreCount = 1,
-                pWaitSemaphores = &swapchain_image_finished_semaphores[image_index],
-                swapchainCount = 1,
-                pSwapchains = &swapchain,
-                pImageIndices = &image_index,
-                pResults = &present_results,
-            })
+            if visuals_enabled {
+                present_results: vk.Result
+                result = vk.QueuePresentKHR(queue, &{
+                    sType = .PRESENT_INFO_KHR,
+                    waitSemaphoreCount = 1,
+                    pWaitSemaphores = &swapchain_image_finished_semaphores[image_index],
+                    swapchainCount = 1,
+                    pSwapchains = &swapchain,
+                    pImageIndices = &image_index,
+                    pResults = &present_results,
+                })
+            }
 
-            if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR {assert(vk.DeviceWaitIdle(device) == .SUCCESS)
+            if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR {
+                assert(vk.DeviceWaitIdle(device) == .SUCCESS)
                 surface_capabilities, swapchain_enabled = resize_swapchain(device, physical_device, surface, &swapchain, &swapchain_image_count, &swapchain_images, &swapchain_image_views, &swapchain_image_finished_semaphores)
 
                 vk.DestroyImageView(device, depth_texture_view, nil)
@@ -1889,7 +2331,7 @@ main :: proc() {
                     
                     gpu_screen_allocation, gpu_screen_allocation_result = allocate_for_resources(device, physical_device, gpu_screen_allocation_residents, { .DEVICE_LOCAL }, minimum_size = 3 * depth_texture_memory_requirements.size / 2)
                     assert(gpu_screen_allocation_result == .SUCCESS)
-                    assert(bind_resources_to_allocation(device, gpu_screen_allocation) == .SUCCESS)
+                    assert(bind_resources_to_allocation(device, &gpu_screen_allocation) == .SUCCESS)
                 } else {
                     replace_resource_in_allocation(device, &gpu_screen_allocation, gpu_screen_allocation_residents[0], {
                         handle = depth_texture,

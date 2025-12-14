@@ -1,17 +1,16 @@
-odin build . -debug -out:build/vulkan
+if [ "$1" == "release" ]; then
+    odin build . -out:build/vulkan
+else
+    odin build . -debug -out:build/vulkan
+fi
+
 if [ $? == "0" ]; then
     if [ "$1" == "run" ]; then
-        cd "./build"
-        "./vulkan"
-        cd "../"
+        "./build/vulkan" ${@:2}
     elif [ "$1" == "lldb" ]; then
-        cd "./build"
-        lldb "./vulkan"
-        cd "../"
+        lldb "./build/vulkan" ${@:2}
     elif [ "$1" == "renderdoc" ]; then
-        cd "./build"
         qrenderdoc
-        cd "../"
     fi
 else
     echo "--- Build failed"
